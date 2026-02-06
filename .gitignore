@@ -1,0 +1,6 @@
+target/
+tools/llvm-mingw*/
+tools/*.zip
+tools/mingw64/
+tools/winlibs.zip
+**/*.log
