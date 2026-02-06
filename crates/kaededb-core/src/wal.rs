@@ -88,9 +88,7 @@ impl Wal {
     }
 
     pub fn truncate(&mut self) -> Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .open(&self.path)?;
+        let mut file = OpenOptions::new().write(true).open(&self.path)?;
         file.set_len(0)?;
         file.seek(SeekFrom::Start(0))?;
         self.writer = BufWriter::new(file);

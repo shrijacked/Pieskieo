@@ -5,7 +5,7 @@ use crate::wal::{DataFamily, RecordKind, Wal};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -22,12 +22,19 @@ pub struct KaedeDb {
     pub(crate) data: Arc<RwLock<Collections>>,
     pub(crate) vectors: VectorIndex,
     pub(crate) graph: GraphStore,
+    link_top_k: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpsertDoc {
     pub id: Uuid,
     pub json: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VecWalRecord {
+    vector: Vec<f32>,
+    meta: Option<HashMap<String, String>>,
 }
 
 impl KaedeDb {
@@ -62,10 +69,15 @@ impl KaedeDb {
                         let v: Value = serde_json::from_slice(&payload)?;
                         data.write().rows.insert(key, v);
                     }
-                    DataFamily::Vec => {
-                        let vec: Vec<f32> = bincode::deserialize(&payload)?;
-                        let _ = vectors.insert(key, vec);
-                    }
+                    DataFamily::Vec => match bincode::deserialize::<VecWalRecord>(&payload) {
+                        Ok(rec) => {
+                            let _ = vectors.insert(key, rec.vector, rec.meta);
+                        }
+                        Err(_) => {
+                            let vec: Vec<f32> = bincode::deserialize(&payload)?;
+                            let _ = vectors.insert(key, vec, None);
+                        }
+                    },
                     DataFamily::Graph => {
                         let edge: crate::graph::Edge = bincode::deserialize(&payload)?;
                         graph.add_edge(edge.src, edge.dst, edge.weight);
@@ -102,6 +114,7 @@ impl KaedeDb {
             data,
             vectors,
             graph,
+            link_top_k: params.link_top_k,
         })
     }
 
@@ -163,13 +176,26 @@ impl KaedeDb {
     }
 
     pub fn put_vector(&self, id: Uuid, vector: Vec<f32>) -> Result<()> {
-        let payload = bincode::serialize(&vector)?;
+        self.put_vector_with_meta(id, vector, None)
+    }
+
+    pub fn put_vector_with_meta(
+        &self,
+        id: Uuid,
+        vector: Vec<f32>,
+        meta: Option<HashMap<String, String>>,
+    ) -> Result<()> {
+        let payload = bincode::serialize(&VecWalRecord {
+            vector: vector.clone(),
+            meta: meta.clone(),
+        })?;
         self.append_record(&RecordKind::Put {
             family: DataFamily::Vec,
             key: id,
             payload,
         })?;
-        self.vectors.insert(id, vector)?;
+        self.vectors.insert(id, vector, meta)?;
+        self.auto_link_neighbors(id);
         Ok(())
     }
 
@@ -186,7 +212,37 @@ impl KaedeDb {
         Ok(())
     }
 
-    pub fn search_vector(&self, query: &[f32], k: usize) -> Result<Vec<crate::vector::VectorSearchResult>> {
+    fn auto_link_neighbors(&self, id: Uuid) {
+        if self.link_top_k == 0 {
+            return;
+        }
+        let vector = {
+            let guard = self.vectors.inner.read();
+            guard.get(&id).cloned()
+        };
+        let Some(vector) = vector else {
+            return;
+        };
+        let mut hits = match self
+            .vectors
+            .search_ann_filtered(&vector, self.link_top_k + 1, None)
+        {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        hits.retain(|h| h.id != id);
+        for h in hits.into_iter().take(self.link_top_k) {
+            let weight = 1.0 / (1.0 + h.score.abs());
+            let _ = self.add_edge(id, h.id, weight);
+            let _ = self.add_edge(h.id, id, weight);
+        }
+    }
+
+    pub fn search_vector(
+        &self,
+        query: &[f32],
+        k: usize,
+    ) -> Result<Vec<crate::vector::VectorSearchResult>> {
         self.vectors.search(query, k)
     }
 
@@ -195,9 +251,8 @@ impl KaedeDb {
         query: &[f32],
         k: usize,
         metric: crate::vector::VectorMetric,
+        filter_meta: Option<HashMap<String, String>>,
     ) -> Result<Vec<crate::vector::VectorSearchResult>> {
-        // Temporary metric override by cloning a lightweight view.
-        // For production, move metric into index config and rebuild when it changes.
         let local = crate::vector::VectorIndex::from_shared(
             self.vectors.inner.clone(),
             self.vectors.dim.clone(),
@@ -219,9 +274,9 @@ impl KaedeDb {
                     .load(std::sync::atomic::Ordering::SeqCst),
             ),
             self.vectors.max_elements,
+            self.vectors.meta.clone(),
         );
-        // Prefer ANN path when possible.
-        local.search_ann(query, k)
+        local.search_ann_filtered(query, k, filter_meta)
     }
 
     pub fn add_edge(&self, src: Uuid, dst: Uuid, weight: f32) -> Result<()> {
@@ -269,7 +324,10 @@ impl KaedeDb {
             vectors: self.vectors.inner.read().len(),
             vector_tombstones: self.vectors.tombstones.read().len(),
             hnsw_ready: self.vectors.hnsw.read().is_some(),
-            ef_search: self.vectors.ef_search.load(std::sync::atomic::Ordering::SeqCst),
+            ef_search: self
+                .vectors
+                .ef_search
+                .load(std::sync::atomic::Ordering::SeqCst),
             ef_construction: self
                 .vectors
                 .ef_construction
@@ -281,6 +339,7 @@ impl KaedeDb {
             snapshot_mtime: std::fs::metadata(self.path.join("vectors.snapshot"))
                 .and_then(|m| m.modified())
                 .ok(),
+            link_top_k: self.link_top_k,
         }
     }
 
@@ -295,6 +354,7 @@ pub struct VectorParams {
     pub ef_construction: usize,
     pub ef_search: usize,
     pub max_elements: usize,
+    pub link_top_k: usize,
 }
 
 pub struct MetricsSnapshot {
@@ -308,6 +368,7 @@ pub struct MetricsSnapshot {
     pub wal_path: std::path::PathBuf,
     pub wal_bytes: u64,
     pub snapshot_mtime: Option<std::time::SystemTime>,
+    pub link_top_k: usize,
 }
 
 impl Default for VectorParams {
@@ -317,6 +378,7 @@ impl Default for VectorParams {
             ef_construction: 200,
             ef_search: 50,
             max_elements: 100_000,
+            link_top_k: 0,
         }
     }
 }
@@ -358,6 +420,29 @@ mod tests {
         let neighbors = db.neighbors(a, 10);
         assert_eq!(neighbors.len(), 1);
         assert_eq!(neighbors[0].dst, b);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn auto_links_neighbors_when_enabled() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let db = KaedeDb::open_with_params(
+            dir.path(),
+            VectorParams {
+                link_top_k: 1,
+                ..Default::default()
+            },
+        )?;
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        db.put_vector(a, vec![0.0, 0.0])?;
+        db.put_vector(b, vec![0.0, 0.1])?;
+
+        let neighbors = db.neighbors(a, 10);
+        assert!(
+            neighbors.iter().any(|e| e.dst == b),
+            "expected auto-linked neighbor"
+        );
         Ok(())
     }
 }

@@ -23,9 +23,12 @@ impl GraphStore {
 
     pub fn add_edge(&self, src: Uuid, dst: Uuid, weight: f32) {
         let mut adj = self.adj.write();
-        adj.entry(src)
-            .or_insert_with(Vec::new)
-            .push(Edge { src, dst, weight });
+        let entry = adj.entry(src).or_insert_with(Vec::new);
+        if let Some(existing) = entry.iter_mut().find(|e| e.dst == dst) {
+            existing.weight = weight;
+        } else {
+            entry.push(Edge { src, dst, weight });
+        }
     }
 
     pub fn neighbors(&self, id: Uuid, limit: usize) -> Vec<Edge> {

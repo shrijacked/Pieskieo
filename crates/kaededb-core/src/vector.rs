@@ -4,13 +4,13 @@ use parking_lot::RwLock;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::Path;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
-use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
-use std::path::Path;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +40,7 @@ pub struct VectorIndex {
     pub(crate) ef_construction: AtomicUsize,
     pub(crate) ef_search: AtomicUsize,
     pub(crate) max_elements: usize,
+    pub(crate) meta: Arc<RwLock<HashMap<Uuid, HashMap<String, String>>>>,
 }
 
 impl VectorIndex {
@@ -57,6 +58,7 @@ impl VectorIndex {
             ef_construction: AtomicUsize::new(200),
             ef_search: AtomicUsize::new(50),
             max_elements: 100_000,
+            meta: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -87,6 +89,7 @@ impl VectorIndex {
         ef_construction: AtomicUsize,
         ef_search: AtomicUsize,
         max_elements: usize,
+        meta: Arc<RwLock<HashMap<Uuid, HashMap<String, String>>>>,
     ) -> Self {
         Self {
             inner,
@@ -101,10 +104,16 @@ impl VectorIndex {
             ef_construction,
             ef_search,
             max_elements,
+            meta,
         }
     }
 
-    pub fn insert(&self, id: Uuid, mut vector: Vec<f32>) -> Result<()> {
+    pub fn insert(
+        &self,
+        id: Uuid,
+        mut vector: Vec<f32>,
+        meta: Option<HashMap<String, String>>,
+    ) -> Result<()> {
         // Enforce consistent dimensionality.
         {
             let mut dim_guard = self.dim.write();
@@ -123,6 +132,9 @@ impl VectorIndex {
 
         // Update primary store.
         self.inner.write().insert(id, vector.clone());
+        if let Some(m) = meta {
+            self.meta.write().insert(id, m);
+        }
         self.tombstones.write().remove(&id);
 
         // Assign stable internal ID.
@@ -175,6 +187,15 @@ impl VectorIndex {
     }
 
     pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<VectorSearchResult>> {
+        self.search_filtered(query, k, None)
+    }
+
+    pub fn search_filtered(
+        &self,
+        query: &[f32],
+        k: usize,
+        filter_meta: Option<HashMap<String, String>>,
+    ) -> Result<Vec<VectorSearchResult>> {
         if query.is_empty() {
             return Err(KaedeDbError::NotFound);
         }
@@ -212,12 +233,34 @@ impl VectorIndex {
             })
             .collect();
         scores.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        if let Some(filters) = filter_meta {
+            scores.retain(|hit| {
+                let meta = self.meta.read();
+                if let Some(m) = meta.get(&hit.id) {
+                    filters
+                        .iter()
+                        .all(|(k, v)| m.get(k).map(|mv| mv == v).unwrap_or(false))
+                } else {
+                    false
+                }
+            });
+        }
+
         scores.truncate(k);
         Ok(scores)
     }
 
     /// Attempt ANN search using HNSW; fall back to exact if unavailable.
     pub fn search_ann(&self, query: &[f32], k: usize) -> Result<Vec<VectorSearchResult>> {
+        self.search_ann_filtered(query, k, None)
+    }
+
+    pub fn search_ann_filtered(
+        &self,
+        query: &[f32],
+        k: usize,
+        filter_meta: Option<HashMap<String, String>>,
+    ) -> Result<Vec<VectorSearchResult>> {
         let mut qbuf: Vec<f32> = query.to_vec();
         if matches!(self.metric, VectorMetric::Cosine) {
             normalize(&mut qbuf);
@@ -235,9 +278,26 @@ impl VectorIndex {
                 })
                 .filter(|r| !self.tombstones.read().contains_key(&r.id))
                 .collect();
-            return Ok(hits);
+            let mut filtered: Vec<_> = match filter_meta {
+                None => hits,
+                Some(filters) => hits
+                    .into_iter()
+                    .filter(|hit| {
+                        let meta = self.meta.read();
+                        if let Some(m) = meta.get(&hit.id) {
+                            filters
+                                .iter()
+                                .all(|(k, v)| m.get(k).map(|mv| mv == v).unwrap_or(false))
+                        } else {
+                            false
+                        }
+                    })
+                    .collect(),
+            };
+            filtered.truncate(k);
+            return Ok(filtered);
         }
-        self.search(query, k)
+        self.search_filtered(query, k, filter_meta)
     }
 
     fn maybe_rebuild(&self) {
@@ -261,6 +321,7 @@ impl VectorIndex {
             self.ef_construction.load(Ordering::SeqCst),
             DistL2 {},
         );
+        let mut owned = Vec::new();
         {
             let data = self.inner.read();
             let tomb = self.tombstones.read();
@@ -268,9 +329,12 @@ impl VectorIndex {
                 if tomb.contains_key(id) {
                     continue;
                 }
+                // prepare backing
                 let boxed: Box<[f32]> = vec.clone().into_boxed_slice();
                 let leaked: &'static [f32] = Box::leak(boxed);
-                self.owned_store.write().push(leaked);
+                owned.push(leaked);
+
+                // ensure id mappings
                 let internal = {
                     let mut map = self.id_map.write();
                     if let Some(existing) = map.get(id) {
@@ -286,18 +350,28 @@ impl VectorIndex {
                         new_id
                     }
                 };
+                // insert into new hnsw
                 hnsw.insert((leaked, internal));
             }
+        }
+        // replace owned_store and hnsw atomically
+        {
+            let mut store = self.owned_store.write();
+            *store = owned;
         }
         *self.hnsw.write() = Some(hnsw);
         Ok(())
     }
 
-    /// Persist vectors (and their ids) to a snapshot file for fast reload.
+    /// Persist vectors (ids + optional metadata) to a snapshot file for fast reload.
     pub fn save_snapshot(&self, path: impl AsRef<Path>) -> Result<()> {
-        let data: Vec<(Uuid, Vec<f32>)> = {
+        let data: Vec<(Uuid, Vec<f32>, Option<HashMap<String, String>>)> = {
             let guard = self.inner.read();
-            guard.iter().map(|(id, v)| (*id, v.clone())).collect()
+            let meta = self.meta.read();
+            guard
+                .iter()
+                .map(|(id, v)| (*id, v.clone(), meta.get(id).cloned()))
+                .collect()
         };
         let file = File::create(path)?;
         let mut w = BufWriter::new(file);
@@ -311,9 +385,15 @@ impl VectorIndex {
 
     /// Load vectors from snapshot, rebuilding in-memory and HNSW state.
     pub fn load_snapshot(&self, path: impl AsRef<Path>) -> Result<()> {
-        let file = File::open(path)?;
-        let mut r = BufReader::new(file);
-        let entries: Vec<(Uuid, Vec<f32>)> = bincode::deserialize_from(&mut r)?;
+        let bytes = std::fs::read(path)?;
+        // Prefer V2 (with metadata); fallback to V1 for backward compatibility.
+        let entries_v2: Result<Vec<(Uuid, Vec<f32>, Option<HashMap<String, String>>)>> =
+            bincode::deserialize(&bytes).map_err(KaedeDbError::from);
+        let entries_v1: Option<Vec<(Uuid, Vec<f32>)>> = if entries_v2.is_err() {
+            bincode::deserialize(&bytes).ok()
+        } else {
+            None
+        };
 
         // Clear existing state.
         {
@@ -326,9 +406,16 @@ impl VectorIndex {
             *self.hnsw.write() = None;
         }
 
-        for (id, vec) in entries {
-            // reuse insert to keep invariants and HNSW built
-            self.insert(id, vec)?;
+        if let Ok(entries) = entries_v2 {
+            for (id, vec, meta) in entries {
+                self.insert(id, vec, meta)?;
+            }
+        } else if let Some(entries) = entries_v1 {
+            for (id, vec) in entries {
+                self.insert(id, vec, None)?;
+            }
+        } else {
+            return Err(KaedeDbError::NotFound);
         }
         Ok(())
     }
@@ -344,7 +431,6 @@ impl VectorIndex {
         }
         Ok(())
     }
-
 
     pub fn set_ef_search(&self, ef: usize) {
         self.ef_search.store(ef.max(1), Ordering::SeqCst);

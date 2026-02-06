@@ -1,7 +1,12 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::{extract::{Path, State}, routing::{get, post, delete}, Json, Router};
+use axum::{
+    extract::{Path, State},
+    routing::{delete, get, post},
+    Json, Router,
+};
 use kaededb_core::{KaedeDb, KaedeDbError, VectorParams as KaedeDbVectorParams};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -23,6 +28,7 @@ struct DocInput {
 struct VectorInput {
     id: Uuid,
     vector: Vec<f32>,
+    meta: Option<HashMap<String, String>>,
 }
 
 #[derive(Deserialize)]
@@ -43,6 +49,7 @@ struct VectorSearchInput {
     metric: Option<String>,
     filter_ids: Option<Vec<Uuid>>,
     ef_search: Option<usize>,
+    filter_meta: Option<HashMap<String, String>>,
 }
 
 #[derive(Deserialize)]
@@ -154,66 +161,92 @@ fn vector_params_from_env() -> KaedeDbVectorParams {
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(100_000);
+    let link_top_k = std::env::var("KAEDEDB_LINK_K")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(4);
 
     KaedeDbVectorParams {
         metric,
         ef_construction: ef_c,
         ef_search: ef_s,
         max_elements: max_el,
+        link_top_k,
     }
 }
 async fn health() -> &'static str {
     "ok"
 }
 
-async fn put_doc(State(state): State<AppState>, Json(input): Json<DocInput>) -> Result<Json<ApiResponse<Uuid>>, ApiError> {
+async fn put_doc(
+    State(state): State<AppState>,
+    Json(input): Json<DocInput>,
+) -> Result<Json<ApiResponse<Uuid>>, ApiError> {
     let id = input.id.unwrap_or_else(Uuid::new_v4);
-    state
-        .db
-        .put_doc(id, input.data)
-        .map_err(ApiError::from)?;
+    state.db.put_doc(id, input.data).map_err(ApiError::from)?;
     Ok(Json(ApiResponse { ok: true, data: id }))
 }
 
-async fn get_doc(State(state): State<AppState>, Path(id): Path<Uuid>) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
-    let doc = state
-        .db
-        .get_doc(&id)
-        .ok_or(ApiError::NotFound)?;
-    Ok(Json(ApiResponse { ok: true, data: doc }))
+async fn get_doc(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
+    let doc = state.db.get_doc(&id).ok_or(ApiError::NotFound)?;
+    Ok(Json(ApiResponse {
+        ok: true,
+        data: doc,
+    }))
 }
 
-async fn delete_doc(State(state): State<AppState>, Path(id): Path<Uuid>) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
+async fn delete_doc(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
     state.db.delete_doc(&id).map_err(ApiError::from)?;
-    Ok(Json(ApiResponse { ok: true, data: "deleted" }))
+    Ok(Json(ApiResponse {
+        ok: true,
+        data: "deleted",
+    }))
 }
 
-async fn put_row(State(state): State<AppState>, Json(input): Json<RowInput>) -> Result<Json<ApiResponse<Uuid>>, ApiError> {
+async fn put_row(
+    State(state): State<AppState>,
+    Json(input): Json<RowInput>,
+) -> Result<Json<ApiResponse<Uuid>>, ApiError> {
     let id = input.id.unwrap_or_else(Uuid::new_v4);
-    state
-        .db
-        .put_row(id, &input.data)
-        .map_err(ApiError::from)?;
+    state.db.put_row(id, &input.data).map_err(ApiError::from)?;
     Ok(Json(ApiResponse { ok: true, data: id }))
 }
 
-async fn get_row(State(state): State<AppState>, Path(id): Path<Uuid>) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
-    let row = state
-        .db
-        .get_row(&id)
-        .ok_or(ApiError::NotFound)?;
-    Ok(Json(ApiResponse { ok: true, data: row }))
+async fn get_row(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
+    let row = state.db.get_row(&id).ok_or(ApiError::NotFound)?;
+    Ok(Json(ApiResponse {
+        ok: true,
+        data: row,
+    }))
 }
 
-async fn delete_row(State(state): State<AppState>, Path(id): Path<Uuid>) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
+async fn delete_row(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
     state.db.delete_row(&id).map_err(ApiError::from)?;
-    Ok(Json(ApiResponse { ok: true, data: "deleted" }))
+    Ok(Json(ApiResponse {
+        ok: true,
+        data: "deleted",
+    }))
 }
 
-async fn put_vector(State(state): State<AppState>, Json(input): Json<VectorInput>) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
+async fn put_vector(
+    State(state): State<AppState>,
+    Json(input): Json<VectorInput>,
+) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
     state
         .db
-        .put_vector(input.id, input.vector)
+        .put_vector_with_meta(input.id, input.vector, input.meta)
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse {
         ok: true,
@@ -221,21 +254,39 @@ async fn put_vector(State(state): State<AppState>, Json(input): Json<VectorInput
     }))
 }
 
-async fn put_vector_bulk(State(state): State<AppState>, Json(input): Json<VectorBulk>) -> Result<Json<ApiResponse<usize>>, ApiError> {
+async fn put_vector_bulk(
+    State(state): State<AppState>,
+    Json(input): Json<VectorBulk>,
+) -> Result<Json<ApiResponse<usize>>, ApiError> {
     let mut stored = 0usize;
     for item in input.items {
-        state.db.put_vector(item.id, item.vector.clone()).map_err(ApiError::from)?;
+        state
+            .db
+            .put_vector_with_meta(item.id, item.vector.clone(), item.meta.clone())
+            .map_err(ApiError::from)?;
         stored += 1;
     }
-    Ok(Json(ApiResponse { ok: true, data: stored }))
+    Ok(Json(ApiResponse {
+        ok: true,
+        data: stored,
+    }))
 }
 
-async fn delete_vector(State(state): State<AppState>, Path(id): Path<Uuid>) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
+async fn delete_vector(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
     state.db.delete_vector(&id).map_err(ApiError::from)?;
-    Ok(Json(ApiResponse { ok: true, data: "deleted" }))
+    Ok(Json(ApiResponse {
+        ok: true,
+        data: "deleted",
+    }))
 }
 
-async fn search_vector(State(state): State<AppState>, Json(input): Json<VectorSearchInput>) -> Result<Json<ApiResponse<Vec<kaededb_core::VectorSearchResult>>>, ApiError> {
+async fn search_vector(
+    State(state): State<AppState>,
+    Json(input): Json<VectorSearchInput>,
+) -> Result<Json<ApiResponse<Vec<kaededb_core::VectorSearchResult>>>, ApiError> {
     let k = input.k.unwrap_or(10);
     let metric = match input.metric.as_deref() {
         Some("cosine") => kaededb_core::vector::VectorMetric::Cosine,
@@ -249,51 +300,88 @@ async fn search_vector(State(state): State<AppState>, Json(input): Json<VectorSe
     }
 
     // For now metric selection is per-query; in future persist per-index config.
-    let mut hits = state.db.search_vector_metric(&input.query, k, metric)?;
+    let mut hits =
+        state
+            .db
+            .search_vector_metric(&input.query, k, metric, input.filter_meta.clone())?;
     if let Some(filter_ids) = input.filter_ids {
         let allow: std::collections::HashSet<Uuid> = filter_ids.into_iter().collect();
         hits.retain(|h| allow.contains(&h.id));
     }
-    Ok(Json(ApiResponse { ok: true, data: hits }))
+    Ok(Json(ApiResponse {
+        ok: true,
+        data: hits,
+    }))
 }
 
-async fn rebuild_vectors(State(state): State<AppState>) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
+async fn rebuild_vectors(
+    State(state): State<AppState>,
+) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
     state.db.rebuild_vectors().map_err(ApiError::from)?;
-    Ok(Json(ApiResponse { ok: true, data: "rebuilt" }))
+    Ok(Json(ApiResponse {
+        ok: true,
+        data: "rebuilt",
+    }))
 }
 
-async fn save_snapshot(State(state): State<AppState>) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
+async fn save_snapshot(
+    State(state): State<AppState>,
+) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
     state.db.save_vector_snapshot().map_err(ApiError::from)?;
-    Ok(Json(ApiResponse { ok: true, data: "saved" }))
+    Ok(Json(ApiResponse {
+        ok: true,
+        data: "saved",
+    }))
 }
 
-async fn add_edge(State(state): State<AppState>, Json(input): Json<EdgeInput>) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
+async fn add_edge(
+    State(state): State<AppState>,
+    Json(input): Json<EdgeInput>,
+) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
     let weight = input.weight.unwrap_or(1.0);
     state
         .db
         .add_edge(input.src, input.dst, weight)
         .map_err(ApiError::from)?;
-    Ok(Json(ApiResponse { ok: true, data: "stored" }))
+    Ok(Json(ApiResponse {
+        ok: true,
+        data: "stored",
+    }))
 }
 
-async fn list_neighbors(State(state): State<AppState>, Path(id): Path<Uuid>) -> Result<Json<ApiResponse<Vec<kaededb_core::Edge>>>, ApiError> {
+async fn list_neighbors(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ApiResponse<Vec<kaededb_core::Edge>>>, ApiError> {
     let edges = state.db.neighbors(id, 100);
-    Ok(Json(ApiResponse { ok: true, data: edges }))
+    Ok(Json(ApiResponse {
+        ok: true,
+        data: edges,
+    }))
 }
 
-async fn metrics(State(state): State<AppState>) -> Result<impl axum::response::IntoResponse, ApiError> {
+async fn metrics(
+    State(state): State<AppState>,
+) -> Result<impl axum::response::IntoResponse, ApiError> {
     let m = state.db.metrics();
     let body = format!(
-        "kaededb_docs {}\nkaededb_rows {}\nkaededb_vectors {}\nkaededb_vector_tombstones {}\nkaededb_hnsw_ready {}\nkaededb_ef_search {}\nkaededb_ef_construction {}\n",
+        "kaededb_docs {}\nkaededb_rows {}\nkaededb_vectors {}\nkaededb_vector_tombstones {}\nkaededb_hnsw_ready {}\nkaededb_ef_search {}\nkaededb_ef_construction {}\nkaededb_link_top_k {}\n",
         m.docs,
         m.rows,
         m.vectors,
         m.vector_tombstones,
         m.hnsw_ready as u8,
         m.ef_search,
-        m.ef_construction
+        m.ef_construction,
+        m.link_top_k,
     );
-    let resp = ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")], body);
+    let resp = (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        body,
+    );
     Ok(resp)
 }
 
