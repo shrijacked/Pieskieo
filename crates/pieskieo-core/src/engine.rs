@@ -197,6 +197,14 @@ impl PieskieoDb {
         self.data.read().rows.get(id).cloned()
     }
 
+    pub fn query_docs(&self, filter: &HashMap<String, Value>, limit: usize) -> Vec<(Uuid, Value)> {
+        self.filter_map(&self.data.read().docs, filter, limit)
+    }
+
+    pub fn query_rows(&self, filter: &HashMap<String, Value>, limit: usize) -> Vec<(Uuid, Value)> {
+        self.filter_map(&self.data.read().rows, filter, limit)
+    }
+
     pub fn put_vector(&self, id: Uuid, vector: Vec<f32>) -> Result<()> {
         self.put_vector_with_meta(id, vector, None)
     }
@@ -486,6 +494,41 @@ impl PieskieoDb {
     }
 }
 
+fn value_matches(doc: &Value, filter: &HashMap<String, Value>) -> bool {
+    for (k, v) in filter {
+        if let Some(field) = doc.get(k) {
+            if field != v {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+impl KaedeDb {
+    fn filter_map(
+        &self,
+        map: &BTreeMap<Uuid, Value>,
+        filter: &HashMap<String, Value>,
+        limit: usize,
+    ) -> Vec<(Uuid, Value)> {
+        let mut out = Vec::new();
+        for (id, v) in map.iter() {
+            if !self.owns(id) {
+                continue;
+            }
+            if value_matches(v, filter) {
+                out.push((*id, v.clone()));
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        out
+    }
+}
 #[derive(Clone, Copy)]
 pub struct VectorParams {
     pub metric: VectorMetric,

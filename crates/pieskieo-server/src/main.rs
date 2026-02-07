@@ -26,6 +26,12 @@ struct DocInput {
 }
 
 #[derive(Deserialize)]
+struct QueryInput {
+    filter: HashMap<String, serde_json::Value>,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
 struct VectorInput {
     id: Uuid,
     vector: Vec<f32>,
@@ -231,9 +237,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/doc", post(put_doc))
         .route("/v1/doc/:id", get(get_doc))
         .route("/v1/doc/:id", delete(delete_doc))
+        .route("/v1/doc/query", post(query_docs))
         .route("/v1/row", post(put_row))
         .route("/v1/row/:id", get(get_row))
         .route("/v1/row/:id", delete(delete_row))
+        .route("/v1/row/query", post(query_rows))
         .route("/v1/vector", post(put_vector))
         .route("/v1/vector/:id/meta", post(update_vector_meta))
         .route("/v1/vector/config", post(update_vector_config))
@@ -366,6 +374,28 @@ async fn put_row(
         .put_row(id, &input.data)
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse { ok: true, data: id }))
+}
+
+async fn query_docs(
+    State(state): State<AppState>,
+    Json(input): Json<QueryInput>,
+) -> Result<Json<ApiResponse<Vec<(Uuid, serde_json::Value)>>>, ApiError> {
+    let mut hits = Vec::new();
+    for shard in state.pool.each() {
+        hits.extend(shard.query_docs(&input.filter, input.limit.unwrap_or(100)));
+    }
+    Ok(Json(ApiResponse { ok: true, data: hits }))
+}
+
+async fn query_rows(
+    State(state): State<AppState>,
+    Json(input): Json<QueryInput>,
+) -> Result<Json<ApiResponse<Vec<(Uuid, serde_json::Value)>>>, ApiError> {
+    let mut hits = Vec::new();
+    for shard in state.pool.each() {
+        hits.extend(shard.query_rows(&input.filter, input.limit.unwrap_or(100)));
+    }
+    Ok(Json(ApiResponse { ok: true, data: hits }))
 }
 
 async fn get_row(
