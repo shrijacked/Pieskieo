@@ -5,7 +5,10 @@ use crate::{error::PieskieoError, graph::GraphStore};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlparser::ast::{BinaryOperator, Expr, OrderByExpr, SelectItem, SetExpr, Statement, TableFactor};
+use sqlparser::ast::{
+    BinaryOperator, Expr, Function, FunctionArg, FunctionArgExpr, JoinConstraint, JoinOperator,
+    OrderByExpr, Select, SelectItem, SetExpr, Statement, TableFactor,
+};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::collections::{BTreeMap, HashMap};
@@ -1419,6 +1422,31 @@ struct Projection {
 }
 
 #[derive(Clone)]
+struct JoinSpec {
+    right_ns: String,
+    right_coll: String,
+    right_is_rows: bool,
+    on_left: String,
+    on_right: String,
+}
+
+#[derive(Clone)]
+enum AggKind {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+#[derive(Clone)]
+struct AggExpr {
+    alias: String,
+    field: Option<String>, // None for count(*)
+    kind: AggKind,
+}
+
+#[derive(Clone)]
 struct Condition {
     field: String,
     op: Op,
@@ -1498,26 +1526,43 @@ impl PieskieoDb {
     }
 
     fn exec_select(&self, stmt: &Statement) -> Result<SqlResult> {
-        let (ns, coll, conds, projections, limit, offset, order_by, target_rows) =
+        let (ns, coll, conds, projections, limit, offset, order_by, join_spec, aggs, target_rows) =
             self.parse_select(stmt)?;
-        let mut rows = {
-            let guard = self.data.read();
-            if target_rows {
-                guard
-                    .rows
-                    .get(&ns)
-                    .and_then(|m| m.get(&coll))
-                    .map(|map| self.filter_conditions(map, &conds, usize::MAX, 0))
-                    .unwrap_or_default()
-            } else {
-                guard
-                    .docs
-                    .get(&ns)
-                    .and_then(|m| m.get(&coll))
-                    .map(|map| self.filter_conditions(map, &conds, usize::MAX, 0))
-                    .unwrap_or_default()
+        let mut rows = self.collect_filtered_ns(&ns, &coll, target_rows, &conds);
+        if let Some(join) = join_spec {
+            let right = self.collect_filtered_ns(
+                &join.right_ns,
+                &join.right_coll,
+                join.right_is_rows,
+                &[],
+            );
+            let mut joined = Vec::new();
+            for (lid, lv) in &rows {
+                if let Some(lobj) = lv.as_object() {
+                    let lv_on = lobj.get(&join.on_left);
+                    for (_, rv) in &right {
+                        if let Some(robj) = rv.as_object() {
+                            if robj.get(&join.on_right) == lv_on {
+                                let mut merged = serde_json::Map::new();
+                                for (k, v) in lobj {
+                                    merged.insert(k.clone(), v.clone());
+                                }
+                                for (k, v) in robj {
+                                    let key = if merged.contains_key(k) {
+                                        format!("right_{k}")
+                                    } else {
+                                        k.clone()
+                                    };
+                                    merged.insert(key, v.clone());
+                                }
+                                joined.push((*lid, Value::Object(merged)));
+                            }
+                        }
+                    }
+                }
             }
-        };
+            rows = joined;
+        }
 
         if !order_by.is_empty() {
             rows.sort_by(|a, b| {
@@ -1536,6 +1581,46 @@ impl PieskieoDb {
                 }
                 std::cmp::Ordering::Equal
             });
+        }
+
+        // aggregation (global only, no group by)
+        if !aggs.is_empty() {
+            let mut out_obj = serde_json::Map::new();
+            for agg in aggs {
+                let val = match agg.kind {
+                    AggKind::Count => Value::Number((rows.len() as u64).into()),
+                    AggKind::Sum => {
+                        let nums = Self::collect_nums(&rows, agg.field.as_deref().unwrap_or(""));
+                        let sum: f64 = nums.iter().sum();
+                        Self::num_or_null(sum)
+                    }
+                    AggKind::Avg => {
+                        let nums = Self::collect_nums(&rows, agg.field.as_deref().unwrap_or(""));
+                        if nums.is_empty() {
+                            Value::Null
+                        } else {
+                            let avg = nums.iter().sum::<f64>() / nums.len() as f64;
+                            Self::num_or_null(avg)
+                        }
+                    }
+                    AggKind::Min => {
+                        let nums = Self::collect_nums(&rows, agg.field.as_deref().unwrap_or(""));
+                        nums.into_iter()
+                            .fold(None, |acc, v| Some(acc.map_or(v, |a: f64| a.min(v))))
+                            .map(Self::num_or_null)
+                            .unwrap_or(Value::Null)
+                    }
+                    AggKind::Max => {
+                        let nums = Self::collect_nums(&rows, agg.field.as_deref().unwrap_or(""));
+                        nums.into_iter()
+                            .fold(None, |acc, v| Some(acc.map_or(v, |a: f64| a.max(v))))
+                            .map(Self::num_or_null)
+                            .unwrap_or(Value::Null)
+                    }
+                };
+                out_obj.insert(agg.alias, val);
+            }
+            return Ok(SqlResult::Select(vec![(Uuid::nil(), Value::Object(out_obj))]));
         }
 
         let start = offset.min(rows.len());
@@ -1562,6 +1647,31 @@ impl PieskieoDb {
         Ok(SqlResult::Select(out))
     }
 
+    fn collect_filtered_ns(
+        &self,
+        ns: &str,
+        coll: &str,
+        target_rows: bool,
+        conds: &[Condition],
+    ) -> Vec<(Uuid, Value)> {
+        let guard = self.data.read();
+        if target_rows {
+            guard
+                .rows
+                .get(ns)
+                .and_then(|m| m.get(coll))
+                .map(|map| self.filter_conditions(map, conds, usize::MAX, 0))
+                .unwrap_or_default()
+        } else {
+            guard
+                .docs
+                .get(ns)
+                .and_then(|m| m.get(coll))
+                .map(|map| self.filter_conditions(map, conds, usize::MAX, 0))
+                .unwrap_or_default()
+        }
+    }
+
     fn parse_select(
         &self,
         stmt: &Statement,
@@ -1573,6 +1683,8 @@ impl PieskieoDb {
         usize,
         usize,
         Vec<(String, bool)>,
+        Option<JoinSpec>,
+        Vec<AggExpr>,
         bool,
     )> {
         let (select, query) = match stmt {
@@ -1583,42 +1695,57 @@ impl PieskieoDb {
             _ => return Err(PieskieoError::Internal("only SELECT supported".into())),
         };
         // projections: None == wildcard
-        let projections: Option<Vec<Projection>> = {
-            if select
-                .projection
-                .iter()
-                .any(|p| matches!(p, SelectItem::Wildcard(_)))
-            {
-                None
-            } else {
-                let mut fields = Vec::new();
-                for item in &select.projection {
-                    match item {
-                        SelectItem::UnnamedExpr(Expr::Identifier(id)) => {
-                            fields.push(Projection {
-                                source: id.value.clone(),
-                                alias: id.value.clone(),
-                            });
-                        }
-                        SelectItem::ExprWithAlias {
-                            expr: Expr::Identifier(id),
-                            alias,
-                        } => {
-                            fields.push(Projection {
-                                source: id.value.clone(),
-                                alias: alias.value.clone(),
-                            });
-                        }
-                        _ => {
-                            return Err(PieskieoError::Internal(
-                                "projection item not supported".into(),
-                            ))
-                        }
-                    }
+        let mut projections: Option<Vec<Projection>> = None;
+        let mut aggs: Vec<AggExpr> = Vec::new();
+        let mut saw_wildcard = false;
+        for item in &select.projection {
+            match item {
+                SelectItem::Wildcard(_) => {
+                    saw_wildcard = true;
                 }
-                Some(fields)
+                SelectItem::UnnamedExpr(Expr::Identifier(id)) => {
+                    projections
+                        .get_or_insert_with(Vec::new)
+                        .push(Projection {
+                            source: id.value.clone(),
+                            alias: id.value.clone(),
+                        });
+                }
+                SelectItem::ExprWithAlias {
+                    expr: Expr::Identifier(id),
+                    alias,
+                } => {
+                    projections
+                        .get_or_insert_with(Vec::new)
+                        .push(Projection {
+                            source: id.value.clone(),
+                            alias: alias.value.clone(),
+                        });
+                }
+                SelectItem::UnnamedExpr(Expr::Function(f)) => {
+                    aggs.push(Self::parse_agg(f, None)?);
+                }
+                SelectItem::ExprWithAlias {
+                    expr: Expr::Function(f),
+                    alias,
+                } => {
+                    aggs.push(Self::parse_agg(f, Some(&alias.value))?);
+                }
+                _ => {
+                    return Err(PieskieoError::Internal(
+                        "projection item not supported".into(),
+                    ))
+                }
             }
-        };
+        }
+        if saw_wildcard && projections.is_some() {
+            return Err(PieskieoError::Internal(
+                "mixing * with explicit projections not supported".into(),
+            ));
+        }
+        if saw_wildcard {
+            projections = None;
+        }
         let tbl = select
             .from
             .get(0)
@@ -1627,17 +1754,7 @@ impl PieskieoDb {
                 _ => None,
             })
             .ok_or_else(|| PieskieoError::Internal("FROM required".into()))?;
-        let parts: Vec<String> = tbl.0.iter().map(|i| i.value.clone()).collect();
-        let (family, ns, coll) = match parts.len() {
-            3 => (Some(parts[0].clone()), parts[1].clone(), parts[2].clone()),
-            2 => (None, parts[0].clone(), parts[1].clone()),
-            1 => (None, "default".into(), parts[0].clone()),
-            _ => {
-                return Err(PieskieoError::Internal(
-                    "table name must be [family.]ns.coll".into(),
-                ))
-            }
-        };
+        let (family, ns, coll) = self.split_name(&tbl)?;
         let mut conds = Vec::new();
         if let Some(selection) = &select.selection {
             self.walk_expr(selection, &mut conds)?;
@@ -1662,6 +1779,7 @@ impl PieskieoDb {
         for ob in &query.order_by {
             order_by.push(self.parse_order_by(ob)?);
         }
+        let join_spec = self.parse_join(select)?;
         // family hint or prefix heuristic
         let target_rows = match family.as_deref() {
             Some("rows") | Some("tables") | Some("table") | Some("row") => true,
@@ -1672,7 +1790,9 @@ impl PieskieoDb {
                     || coll.starts_with("tbl_")
             }
         };
-        Ok((ns, coll, conds, projections, limit, offset, order_by, target_rows))
+        Ok((
+            ns, coll, conds, projections, limit, offset, order_by, join_spec, aggs, target_rows,
+        ))
     }
 
     fn parse_order_by(&self, ob: &OrderByExpr) -> Result<(String, bool)> {
@@ -1686,6 +1806,120 @@ impl PieskieoDb {
         };
         let asc = ob.asc.unwrap_or(true);
         Ok((field, asc))
+    }
+
+    fn parse_join(&self, select: &Select) -> Result<Option<JoinSpec>> {
+        if select.from.len() != 1 {
+            return Err(PieskieoError::Internal(
+                "only single FROM item supported".into(),
+            ));
+        }
+        let joins = &select.from[0].joins;
+        if joins.is_empty() {
+            return Ok(None);
+        }
+        if joins.len() > 1 {
+            return Err(PieskieoError::Internal(
+                "only one JOIN supported".into(),
+            ));
+        }
+        let j = &joins[0];
+        // only INNER JOIN
+        let on = match &j.join_operator {
+            JoinOperator::Inner(constraint) => constraint,
+            _ => {
+                return Err(PieskieoError::Internal(
+                    "only INNER JOIN supported".into(),
+                ))
+            }
+        };
+        let right_name = self.extract_name_from_table_factor(&j.relation)?;
+        let (rfam, rns, rcoll) = self.split_name(right_name)?;
+        let right_is_rows = Self::target_is_rows(rfam.as_deref(), &rcoll);
+        let (on_left, on_right) = match on {
+            JoinConstraint::On(expr) => {
+                if let Expr::BinaryOp {
+                    left,
+                    op: BinaryOperator::Eq,
+                    right,
+                } = expr
+                {
+                    let l = Self::ident_name(left)?;
+                    let r = Self::ident_name(right)?;
+                    (l, r)
+                } else {
+                    return Err(PieskieoError::Internal(
+                        "JOIN ON must be equality of identifiers".into(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(PieskieoError::Internal(
+                    "JOIN requires ON clause".into(),
+                ))
+            }
+        };
+        Ok(Some(JoinSpec {
+            right_ns: rns,
+            right_coll: rcoll,
+            right_is_rows,
+            on_left,
+            on_right,
+        }))
+    }
+
+    fn parse_agg(f: &Function, alias: Option<&str>) -> Result<AggExpr> {
+        let name = f.name.to_string().to_lowercase();
+        let kind = match name.as_str() {
+            "count" => AggKind::Count,
+            "sum" => AggKind::Sum,
+            "avg" => AggKind::Avg,
+            "min" => AggKind::Min,
+            "max" => AggKind::Max,
+            _ => {
+                return Err(PieskieoError::Internal(
+                    "aggregate function not supported".into(),
+                ))
+            }
+        };
+        let mut field: Option<String> = None;
+        if let Some(arg) = f.args.first() {
+            match arg {
+                FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => {
+                    if !matches!(kind, AggKind::Count) {
+                        return Err(PieskieoError::Internal(
+                            "only count(*) supports wildcard".into(),
+                        ));
+                    }
+                }
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(id))) => {
+                    field = Some(id.value.clone());
+                }
+                _ => {
+                    return Err(PieskieoError::Internal(
+                        "aggregate argument not supported".into(),
+                    ))
+                }
+            }
+        }
+        Ok(AggExpr {
+            alias: alias.unwrap_or(&name).to_string(),
+            field,
+            kind,
+        })
+    }
+
+    fn collect_nums(rows: &[(Uuid, Value)], field: &str) -> Vec<f64> {
+        rows.iter()
+            .filter_map(|(_, v)| v.get(field))
+            .filter_map(|n| n.as_f64())
+            .collect()
+    }
+
+    fn num_or_null(x: f64) -> Value {
+        serde_json::Number::from_f64(x)
+            .map(Value::Number)
+            .unwrap_or(Value::Null)
     }
 
     fn split_name(
@@ -1821,7 +2055,7 @@ impl PieskieoDb {
             (Some(ns), Some(c)) => {
                 if let Some(ns_map) = map.get(ns) {
                     if let Some(inner) = ns_map.get(c) {
-                        Self::collect_filtered(
+                        Self::collect_filtered_inner(
                             self,
                             inner,
                             filter,
@@ -1836,7 +2070,7 @@ impl PieskieoDb {
             (Some(ns), None) => {
                 if let Some(ns_map) = map.get(ns) {
                     for inner in ns_map.values() {
-                        Self::collect_filtered(
+                        Self::collect_filtered_inner(
                             self,
                             inner,
                             filter,
@@ -1854,7 +2088,7 @@ impl PieskieoDb {
             (None, Some(c)) => {
                 for ns_map in map.values() {
                     if let Some(inner) = ns_map.get(c) {
-                        Self::collect_filtered(
+                        Self::collect_filtered_inner(
                             self,
                             inner,
                             filter,
@@ -1872,7 +2106,7 @@ impl PieskieoDb {
             (None, None) => {
                 for ns_map in map.values() {
                     for inner in ns_map.values() {
-                        Self::collect_filtered(
+                        Self::collect_filtered_inner(
                             self,
                             inner,
                             filter,
@@ -1891,7 +2125,7 @@ impl PieskieoDb {
         out
     }
 
-    fn collect_filtered(
+    fn collect_filtered_inner(
         &self,
         inner: &BTreeMap<Uuid, Value>,
         filter: &HashMap<String, Value>,

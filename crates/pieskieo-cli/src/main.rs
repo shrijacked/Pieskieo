@@ -1,9 +1,9 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use serde::Deserialize;
 use pieskieo_core::{PieskieoDb, VectorParams};
 use pieskieo_server;
 use serde_json::Value;
+use serde::Deserialize;
 use std::io::{self, Write};
 use std::time::Instant;
 use reqwest::blocking::Client;
@@ -310,7 +310,7 @@ fn net_query_sql(
     token: Option<&str>,
     sql: &str,
 ) -> Result<String> {
-    #[derive(serde::Deserialize)]
+    #[derive(Deserialize)]
     struct Resp {
         ok: bool,
         data: serde_json::Value,
