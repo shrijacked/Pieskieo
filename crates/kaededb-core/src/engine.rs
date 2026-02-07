@@ -382,6 +382,27 @@ impl KaedeDb {
         Ok(())
     }
 
+    /// Compact tombstones and WAL by rewriting snapshot and truncating WAL.
+    pub fn vacuum(&self) -> Result<()> {
+        {
+            // drop deleted vectors from in-memory store
+            let tomb = self.vectors.tombstones.read().clone();
+            if !tomb.is_empty() {
+                let mut inner = self.vectors.inner.write();
+                for id in tomb.keys() {
+                    inner.remove(id);
+                }
+            }
+            self.vectors.tombstones.write().clear();
+        }
+        // rebuild ANN for clean state
+        let _ = self.vectors.rebuild_hnsw();
+        // persist fresh snapshot + hnsw and truncate WAL
+        self.save_vector_snapshot()?;
+        self.wal.write().truncate()?;
+        Ok(())
+    }
+
     pub fn flush_wal(&self) -> Result<()> {
         self.wal.write().flush_sync()
     }
@@ -512,6 +533,21 @@ mod tests {
             neighbors.iter().any(|e| e.dst == b),
             "expected auto-linked neighbor"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn vacuum_clears_tombstones_and_wal() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let db = KaedeDb::open(dir.path())?;
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        db.put_vector(a, vec![0.0, 0.0])?;
+        db.put_vector(b, vec![0.0, 0.1])?;
+        db.delete_vector(&a)?;
+        assert!(db.vectors.tombstones.read().contains_key(&a));
+        db.vacuum()?;
+        assert!(!db.vectors.tombstones.read().contains_key(&a));
         Ok(())
     }
 }

@@ -91,6 +91,7 @@ impl Wal {
         let mut file = OpenOptions::new().write(true).open(&self.path)?;
         file.set_len(0)?;
         file.seek(SeekFrom::Start(0))?;
+        file.sync_all()?;
         self.writer = BufWriter::new(file);
         Ok(())
     }

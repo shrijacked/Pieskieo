@@ -162,6 +162,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/vector/config", post(update_vector_config))
         .route("/v1/vector/:id/meta/delete", post(delete_vector_meta_keys))
         .route("/v1/vector/:id", get(get_vector))
+        .route("/v1/vector/vacuum", post(vacuum_vectors))
         .route("/v1/vector/search", post(search_vector))
         .route("/v1/vector/rebuild", post(rebuild_vectors))
         .route("/v1/vector/snapshot/save", post(save_snapshot))
@@ -431,6 +432,16 @@ async fn rebuild_vectors(
     Ok(Json(ApiResponse {
         ok: true,
         data: "rebuilt",
+    }))
+}
+
+async fn vacuum_vectors(
+    State(state): State<AppState>,
+) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
+    state.db.vacuum().map_err(ApiError::from)?;
+    Ok(Json(ApiResponse {
+        ok: true,
+        data: "vacuumed",
     }))
 }
 
