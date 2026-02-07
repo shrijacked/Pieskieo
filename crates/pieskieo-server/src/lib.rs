@@ -1,5 +1,8 @@
 use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -42,6 +45,7 @@ struct AppState {
     pool: Arc<DbPool>,
     auth: Arc<RwLock<AuthConfig>>,
     limiter: Arc<RateLimiter>,
+    audit: Arc<AuditLog>,
 }
 
 #[derive(Clone)]
@@ -55,13 +59,59 @@ struct AuthConfig {
     window: Duration,
 }
 
-#[derive(Clone)]
 struct RateLimiter {
     window: Duration,
     max: u32,
     hits: Arc<Mutex<HashMap<IpAddr, (u32, Instant)>>>,
+    rejected: AtomicU64,
 }
 
+#[derive(Clone)]
+struct AuditLog {
+    path: PathBuf,
+}
+
+impl AuditLog {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    fn write(
+        &self,
+        ip: IpAddr,
+        method: &str,
+        path: &str,
+        status: u16,
+        role: Option<Role>,
+        dur: Duration,
+    ) {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let role = role
+            .map(|r| match r {
+                Role::Admin => "admin",
+                Role::Write => "write",
+                Role::Read => "read",
+            })
+            .unwrap_or("anon")
+            .to_string();
+        let line = format!(
+            "{ts},{ip},{method},{path},{status},{role},{:.3}\n",
+            dur.as_secs_f64() * 1000.0
+        );
+        let target = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Some(parent) = target.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&target) {
+                let _ = f.write_all(line.as_bytes());
+            }
+        });
+    }
+}
 #[derive(Clone)]
 struct UserRec {
     user: String,
@@ -330,10 +380,11 @@ impl RateLimiter {
             window,
             max,
             hits: Arc::new(Mutex::new(HashMap::new())),
+            rejected: AtomicU64::new(0),
         }
     }
 
-    fn allow(&self, ip: IpAddr) -> bool {
+    fn allow(&self, ip: IpAddr) -> Result<(), Duration> {
         let now = Instant::now();
         let mut hits = self.hits.lock().unwrap();
         let entry = hits.entry(ip).or_insert((0, now));
@@ -343,7 +394,12 @@ impl RateLimiter {
             *start = now;
         }
         *count += 1;
-        *count <= self.max
+        if *count <= self.max {
+            Ok(())
+        } else {
+            self.rejected.fetch_add(1, Ordering::Relaxed);
+            Err(self.window.saturating_sub(now.duration_since(*start)))
+        }
     }
 }
 
@@ -550,11 +606,15 @@ pub async fn serve() -> anyhow::Result<()> {
     let shards = params.shard_total.max(1);
     let pool = Arc::new(DbPool::new(&data_dir, params, shards)?);
     let limiter = Arc::new(RateLimiter::from_env());
+    let audit = Arc::new(AuditLog::new(
+        PathBuf::from(&data_dir).join("logs").join("audit.log"),
+    ));
 
     let state = AppState {
         pool,
         auth,
         limiter,
+        audit,
     };
 
     // background WAL flusher (group commit) for better latency.
@@ -642,6 +702,10 @@ pub async fn serve() -> anyhow::Result<()> {
         .route("/v1/graph/:id/dfs", get(list_dfs))
         .route("/v1/auth/users", get(list_users))
         .route("/v1/auth/users", post(create_user))
+        .layer(middleware::from_fn_with_state(
+            state.audit.clone(),
+            audit_middleware,
+        ))
         .layer(middleware::from_fn_with_state(
             state.limiter.clone(),
             rate_limit_middleware,
@@ -1316,6 +1380,8 @@ async fn metrics(
         m.link_top_k,
         m.shard_total,
     );
+    let rejects = state.limiter.rejected.load(Ordering::Relaxed);
+    body.push_str(&format!("pieskieo_rate_rejects {}\n", rejects));
     for (idx, shard) in state.pool.shards.iter().enumerate() {
         let s = shard.metrics();
         body.push_str(&format!(
@@ -1387,10 +1453,42 @@ async fn rate_limit_middleware(
     req: Request<Body>,
     next: Next,
 ) -> Result<axum::response::Response, ApiError> {
-    if limiter.allow(addr.ip()) {
-        return Ok(next.run(req).await);
+    match limiter.allow(addr.ip()) {
+        Ok(()) => Ok(next.run(req).await),
+        Err(retry_after) => {
+            let mut resp = axum::response::Response::new(axum::body::Body::empty());
+            *resp.status_mut() = axum::http::StatusCode::TOO_MANY_REQUESTS;
+            resp.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_str(&retry_after.as_secs().max(1).to_string())
+                    .unwrap_or(axum::http::HeaderValue::from_static("60")),
+            );
+            Ok(resp)
+        }
     }
-    Err(ApiError::TooMany)
+}
+
+async fn audit_middleware(
+    State(audit): State<Arc<AuditLog>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    req: Request<Body>,
+    next: Next,
+) -> Result<axum::response::Response, ApiError> {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let start = Instant::now();
+    let role = req.extensions().get::<Role>().copied();
+    let res = next.run(req).await;
+    let status = res.status().as_u16();
+    audit.write(
+        addr.ip(),
+        method.as_str(),
+        &path,
+        status,
+        role,
+        start.elapsed(),
+    );
+    Ok(res)
 }
 
 fn authorize(role: Role, path: &str, method: &str) -> bool {
@@ -1467,7 +1565,6 @@ enum ApiError {
     Conflict(String),
     Unauthorized,
     Forbidden,
-    TooMany,
     Internal(anyhow::Error),
 }
 
@@ -1495,7 +1592,6 @@ impl axum::response::IntoResponse for ApiError {
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
             ApiError::Unauthorized => StatusCode::UNAUTHORIZED.into_response(),
             ApiError::Forbidden => StatusCode::FORBIDDEN.into_response(),
-            ApiError::TooMany => StatusCode::TOO_MANY_REQUESTS.into_response(),
             ApiError::Internal(err) => {
                 tracing::error!("api_error" = %err);
                 StatusCode::INTERNAL_SERVER_ERROR.into_response()

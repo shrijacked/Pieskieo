@@ -23,7 +23,7 @@ Unified multi‑model engine: relational (Postgres‑ish), document (Mongo‑ish
 - ⏳ Release pipeline (dist artifacts, signing), public benchmarks.
 
 ## Near-term TODO (next moves)
-1) Harden surface: TLS by default in prod, per‑IP/backoff rate limits (added), audit logs.  
+1) Harden surface: TLS by default in prod, per‑IP/backoff rate limits (done), audit logs (done).  
 2) Planner v2: cost model + index selection, vector+filter fusion.  
 3) Distributed story: reshard without downtime, async replication + follower reads.  
 4) Benchmarks: publish latency/recall for 768 & 3072 dims; crash/chaos matrix.  

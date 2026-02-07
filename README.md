@@ -77,6 +77,8 @@ cargo run -p pieskieo-cli -- --connect pieskieo@localhost --port 8000 -W
 - Basic auth for per-user, Bearer token via `PIESKIEO_TOKEN` for admin automation.
 - Enable TLS with `PIESKIEO_TLS_CERT` / `PIESKIEO_TLS_KEY` (PEM).
 - Per-IP rate limit middleware (default 300 requests / 60s); tune via `PIESKIEO_RATE_MAX` and `PIESKIEO_RATE_WINDOW_SECS`.
+- Rate-limit responses return `429` with `Retry-After` seconds.
+- Audit log written to `<data>/logs/audit.log` with timestamp, ip, method, path, status, role, latency.
 
 ## CLI quickstart
 - Connect: `pieskieo connect alice@db.example.com --port 8443 -W`
