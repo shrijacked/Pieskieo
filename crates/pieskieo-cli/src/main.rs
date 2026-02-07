@@ -277,6 +277,12 @@ fn default_data_dir() -> PathBuf {
     }
     #[cfg(not(target_os = "windows"))]
     {
+        if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+            return PathBuf::from(xdg).join("pieskieo");
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(".local/share/pieskieo");
+        }
         PathBuf::from("/var/lib/pieskieo")
     }
 }

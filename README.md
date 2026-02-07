@@ -101,7 +101,7 @@ Options: set `PIESKIEO_VERSION` to override (default v0.1.2); `PIESKIEO_PREFIX` 
 - REPL: raw PQL; multi-line supported (enter continues, semicolon sends). `quit` to exit.
 
 ## Config essentials (env)
-- `PIESKIEO_DATA` data dir (defaults: `/var/lib/pieskieo` on Linux/macOS, `%APPDATA%/Pieskieo` on Windows)
+- `PIESKIEO_DATA` data dir (defaults: `$XDG_DATA_HOME/pieskieo` or `~/.local/share/pieskieo` on Linux/macOS, `%APPDATA%/Pieskieo` on Windows)
 - `PIESKIEO_LISTEN` listen addr (default `0.0.0.0:8000`)
 - `PIESKIEO_SHARD_TOTAL` shard count (default 1)
 - `PIESKIEO_EF_SEARCH` / `PIESKIEO_EF_CONSTRUCTION` HNSW knobs

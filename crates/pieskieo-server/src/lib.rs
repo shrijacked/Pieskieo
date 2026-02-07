@@ -941,6 +941,12 @@ fn default_data_dir() -> String {
     }
     #[cfg(not(target_os = "windows"))]
     {
+        if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+            return format!("{xdg}/pieskieo");
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            return format!("{home}/.local/share/pieskieo");
+        }
         "/var/lib/pieskieo".into()
     }
 }
