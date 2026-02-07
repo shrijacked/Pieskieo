@@ -9,12 +9,15 @@ set -euo pipefail
 
 choose_prefix() {
   if [[ -n "${PIESKIEO_PREFIX:-}" ]]; then
+    echo "[installer] prefix provided via PIESKIEO_PREFIX=${PIESKIEO_PREFIX}"
     echo "${PIESKIEO_PREFIX}"
     return
   fi
   if [[ -w /usr/local/bin ]]; then
+    echo "[installer] /usr/local/bin writable; using /usr/local"
     echo "/usr/local"
   else
+    echo "[installer] /usr/local/bin not writable; falling back to ~/.local"
     echo "${HOME}/.local"
   fi
 }
@@ -42,8 +45,10 @@ detect_platform() {
 
 fetch_version() {
   if [[ -n "${PIESKIEO_VERSION:-}" ]]; then
+    echo "[installer] version via PIESKIEO_VERSION=${PIESKIEO_VERSION}"
     echo "${PIESKIEO_VERSION}"
   elif [[ $# -ge 1 && -n "$1" ]]; then
+    echo "[installer] version via arg=$1"
     echo "$1"
   else
     if command -v curl >/dev/null 2>&1; then
@@ -64,35 +69,46 @@ main() {
   local platform version prefix tmp zip url bindst
   platform="$(detect_platform)"
   version="$(fetch_version "$@")"
+  echo "[installer] detected platform: ${platform}"
+  echo "[installer] using version: ${version}"
   url="https://github.com/DarsheeeGamer/Pieskieo/releases/download/${version}/pieskieo-${platform}-${version}.zip"
-  echo "Downloading ${url}"
+  echo "[installer] download url: ${url}"
 
   tmp="$(mktemp -d)"
   zip="${tmp}/pieskieo.zip"
+  echo "[installer] tmp dir: ${tmp}"
+  echo "[installer] zip path: ${zip}"
 
   if command -v curl >/dev/null 2>&1; then
+    echo "[installer] using curl to download"
     curl -fsSL "$url" -o "$zip"
   else
     require_cmd wget
+    echo "[installer] using wget to download"
     wget -q "$url" -O "$zip"
   fi
 
   prefix="$(choose_prefix)"
   bindst="${prefix}/bin"
+  echo "[installer] install prefix: ${prefix}"
+  echo "[installer] bin dest: ${bindst}"
   mkdir -p "$bindst"
 
   if command -v unzip >/dev/null 2>&1; then
+    echo "[installer] extracting with unzip"
     unzip -qo "$zip" -d "$tmp"
   else
     require_cmd tar
+    echo "[installer] extracting with tar"
     (cd "$tmp" && tar -xf "$zip")
   fi
 
+  echo "[installer] installing binaries to ${bindst}"
   install -m 0755 "$tmp"/pieskieo* "$bindst"/
 
-  echo "Installed to $bindst:"
+  echo "[installer] contents installed to $bindst:"
   ls "$bindst"/pieskieo*
-  echo "Ensure $bindst is on your PATH."
+  echo "[installer] done. Ensure $bindst is on your PATH."
 }
 
 main "$@"
