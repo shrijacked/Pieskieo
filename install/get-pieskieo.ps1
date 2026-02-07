@@ -4,7 +4,7 @@ $ErrorActionPreference = "Stop"
 # Usage (PowerShell):
 #   iwr https://raw.githubusercontent.com/DarsheeeGamer/Pieskieo/main/install/get-pieskieo.ps1 -UseBasicParsing | iex
 # Optional env:
-#   PIESKIEO_VERSION   tag to install (e.g., v0.1.2). If unset, latest release is used.
+#   PIESKIEO_VERSION   tag to install (default v0.1.2)
 #   PIESKIEO_PREFIX    install prefix (default: %ProgramData%\Pieskieo or $HOME\.local)
 
 function Choose-Prefix {
@@ -13,16 +13,9 @@ function Choose-Prefix {
   return (Join-Path $HOME ".local")
 }
 
-function Get-Version {
-  if ($env:PIESKIEO_VERSION) { return $env:PIESKIEO_VERSION }
-  $resp = Invoke-WebRequest -UseBasicParsing https://api.github.com/repos/DarsheeeGamer/Pieskieo/releases/latest
-  $json = $resp.Content | ConvertFrom-Json
-  return $json.tag_name
-}
-
 function Main {
-  $version = Get-Version
-  if (-not $version) { throw "Could not determine release version." }
+  $version = $env:PIESKIEO_VERSION
+  if (-not $version) { $version = "v0.1.2" }
   $platform = "windows-x86_64"
   $url = "https://github.com/DarsheeeGamer/Pieskieo/releases/download/$version/pieskieo-$platform-$version.zip"
   Write-Host "Downloading $url"

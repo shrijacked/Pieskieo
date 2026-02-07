@@ -46,12 +46,12 @@ cargo run -p pieskieo-cli -- --connect pieskieo@localhost --port 8000 -W
 - Linux/macOS: `bash install/install.sh` (installs to `/usr/local/bin` or `~/.local/bin`)
 Both scripts build from source with `--release` and copy `pieskieo-server`, `pieskieo`, `load`, `bench`.
 
-### Prebuilt (auto-download)
+### Prebuilt (auto-download, defaults to v0.1.2)
 - Linux/macOS:  
   `curl -fsSL https://raw.githubusercontent.com/DarsheeeGamer/Pieskieo/main/install/get-pieskieo.sh | bash`
 - Windows (PowerShell):  
   `iwr https://raw.githubusercontent.com/DarsheeeGamer/Pieskieo/main/install/get-pieskieo.ps1 -UseBasicParsing | iex`
-Options: set `PIESKIEO_VERSION=v0.1.2` to pin a release; `PIESKIEO_PREFIX` to change install prefix.
+Options: set `PIESKIEO_VERSION` to override (default v0.1.2); `PIESKIEO_PREFIX` to change install prefix.
 
 ## Key features
 - HNSW ANN with persistence (graph + revmap saved/reloaded).
