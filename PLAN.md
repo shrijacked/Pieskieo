@@ -9,23 +9,22 @@ Unified multi‑model engine: relational (Postgres‑ish), document (Mongo‑ish
 - Services: Axum HTTP API, metrics, sharded fan‑out, auth (users/roles, Argon2id), CLI REPL, Python SDK.
 
 ## Status vs Roadmap
-- ✅ Core storage, WAL, snapshots, single‑process sharding.
-- ✅ PQL (CRUD, aggregates, ORDER BY, JOIN eq).
-- ✅ Docs + rows + schemas + secondary indexes.
-- ✅ Vector HNSW (persistent, rebuild, vacuum, filters).
-- ✅ Graph edges + BFS/DFS + neighbors.
-- ✅ Auth (multi‑user, roles, Argon2id, lockout), bearer + basic, default admin fallback.
-- ✅ CLI (connect/repl/serve), Python SDK (sync/async).
-- ✅ Metrics endpoint.
-- ⏳ TLS runtime (added, optional via `--features tls`).
-- ⏳ Security hardening extras (rate‑limit, audit log).
-- ⏳ Distributed reshard/replication, cost‑based optimizer v2, vector+graph co-search planner.
-- ⏳ Release pipeline (dist artifacts, signing), public benchmarks.
+- [x] Core storage, WAL, snapshots, single-process sharding.
+- [x] PQL (CRUD, aggregates, ORDER BY, equality JOIN).
+- [x] Docs + rows + schemas + secondary indexes.
+- [x] Vector HNSW (persistent, rebuild, vacuum, filters).
+- [x] Graph edges + BFS/DFS + neighbors.
+- [x] Auth (multi-user, roles, Argon2id, lockout), bearer + basic, default admin fallback.
+- [x] CLI (connect/repl/serve), Python SDK (sync/async).
+- [x] Metrics endpoint.
+- [x] Cost-based optimizer v2 (metrics-driven equality index selection).
+- [x] Resharding with verification + streaming replication (push/pull); TLS optional via feature flag.
+- [ ] Vector+graph co-search planner; auto-rebalance + follower-reads; release pipeline (dist artifacts, signing), published benchmarks.
 
 ## Near-term TODO (next moves)
-1) Harden surface: TLS by default in prod, per‑IP/backoff rate limits (done), audit logs with rotation (done).  
-2) Planner v2: cost model + index selection, vector+filter fusion (next).  
-3) Distributed story: reshard without downtime, async replication + follower reads (incremental WAL + admin reshard endpoint + CLI follower pull loop added; future: streaming/push + pause/verify workflows).  
+1) Harden surface: ship TLS-on-by-default presets, finalize log + audit shipping.  
+2) Planner v3: vector+filter fusion, join costing.  
+3) Distributed story: auto-rebalance + follower reads; finish end-to-end WAL tail apply with rate limiting.  
 4) Benchmarks: publish latency/recall for 768 & 3072 dims; crash/chaos matrix.  
 5) Release: cargo-dist artifacts, checksums, signed releases, docs site.  
 

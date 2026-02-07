@@ -17,8 +17,8 @@ use tokio::runtime::Runtime;
 #[command(name = "pieskieo", version, about = "Pieskieo database CLI", long_about = None)]
 struct Cli {
     /// Data directory for local embedded mode
-    #[arg(short, long, default_value = "data")]
-    data_dir: PathBuf,
+    #[arg(short, long)]
+    data_dir: Option<PathBuf>,
 
     /// Start HTTP server instead of embedded CLI ops
     #[arg(long)]
@@ -135,9 +135,10 @@ enum Commands {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let data_dir = cli.data_dir.clone().unwrap_or_else(default_data_dir);
 
     if cli.serve {
-        std::env::set_var("PIESKIEO_DATA", cli.data_dir.to_string_lossy().to_string());
+        std::env::set_var("PIESKIEO_DATA", data_dir.to_string_lossy().to_string());
         std::env::set_var("PIESKIEO_LISTEN", cli.listen);
         // hand off to server main
         let rt = Runtime::new()?;
@@ -150,7 +151,7 @@ fn main() -> Result<()> {
     }
 
     // embedded mode
-    let db = PieskieoDb::open_with_params(&cli.data_dir, VectorParams::default())?;
+    let db = PieskieoDb::open_with_params(&data_dir, VectorParams::default())?;
 
     if cli.repl || matches!(cli.command, Some(Commands::Repl)) {
         run_repl(db)?;
@@ -265,6 +266,19 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn default_data_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var("APPDATA")
+            .map(|p| PathBuf::from(p).join("Pieskieo"))
+            .unwrap_or_else(|_| PathBuf::from("C:\\ProgramData\\Pieskieo"))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        PathBuf::from("/var/lib/pieskieo")
+    }
 }
 
 fn run_network_mode(cli: Cli, base_url: &str) -> Result<()> {

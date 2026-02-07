@@ -48,7 +48,7 @@ cargo run -p pieskieo-cli -- --connect pieskieo@localhost --port 8000 -W
 - Transparent sharding inside one process (hash on UUID); fan-out search merges top-k.
 - WAL + snapshot; vacuum to drop tombstones and truncate WAL.
 - Metrics endpoint (Prometheus text) including per-shard gauges.
-- Secondary equality indexes for docs/rows (string/number/bool) scoped per namespace+collection/table for faster filtered queries.
+- Secondary equality indexes for docs/rows (string/number/bool) scoped per namespace+collection/table; **planner picks the most selective bucket using live cardinality stats** (RUST_LOG=planner=debug to trace decisions).
 - Namespaces + collections/tables, plus per-namespace vector indexes.
 - Python SDK (sync + async) with Pydantic models.
 
@@ -89,7 +89,7 @@ cargo run -p pieskieo-cli -- --connect pieskieo@localhost --port 8000 -W
 - REPL commands: raw PQL; `\q` to quit; `\timing` to toggle timings.
 
 ## Config essentials (env)
-- `PIESKIEO_DATA` data dir (default `./data`)
+- `PIESKIEO_DATA` data dir (defaults: `/var/lib/pieskieo` on Linux/macOS, `%APPDATA%/Pieskieo` on Windows)
 - `PIESKIEO_LISTEN` listen addr (default `0.0.0.0:8000`)
 - `PIESKIEO_SHARD_TOTAL` shard count (default 1)
 - `PIESKIEO_EF_SEARCH` / `PIESKIEO_EF_CONSTRUCTION` HNSW knobs
@@ -97,9 +97,10 @@ cargo run -p pieskieo-cli -- --connect pieskieo@localhost --port 8000 -W
 - `PIESKIEO_TLS_CERT`, `PIESKIEO_TLS_KEY` enable TLS (requires `--features tls`)
 - `PIESKIEO_RATE_MAX`, `PIESKIEO_RATE_WINDOW_SECS` per-IP throttling
 - `PIESKIEO_AUDIT_MAX_MB` audit log rotation size (daily files)
+- Logging: `PIESKIEO_LOG_MODE=stdout|file|both` (default stdout); `PIESKIEO_LOG_DIR` overrides log path (else `<data>/logs/pieskieo.log`)
 - `PIESKIEO_AUTH_*` lockout/complexity (see Auth & security)
 - Replication uses admin auth; optionally poll with `since=end_offset` to tail WAL.
-- Reshard uses admin auth and rebuilds shards from WAL; set `PIESKIEO_SHARD_TOTAL` for fresh starts, or use the admin endpoint for live changes.
+- Reshard uses admin auth and rebuilds shards from WAL; set `PIESKIEO_SHARD_TOTAL` for fresh starts, or use the admin endpoint for live changes. Status endpoint now reports verification and per-shard counts before/after.
 
 ## Benchmark tools
 - Core bench: `cargo run -p pieskieo-core --bin bench --release -- <n> <dim> [ef_c] [ef_s]`

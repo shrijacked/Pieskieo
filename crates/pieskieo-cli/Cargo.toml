@@ -16,6 +16,7 @@ rustyline = "13"
 serde = { workspace = true }
 rpassword = "7"
 ctrlc = "3"
+dirs = { workspace = true }
 
 [[bin]]
 name = "pieskieo"

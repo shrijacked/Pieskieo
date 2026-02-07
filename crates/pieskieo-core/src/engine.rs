@@ -101,6 +101,10 @@ impl PieskieoDb {
         "default".to_string()
     }
 
+    pub fn shard_id(&self) -> usize {
+        self.shard_id
+    }
+
     fn enforce_doc_schema(
         &self,
         ns: Option<&str>,
@@ -927,6 +931,7 @@ impl PieskieoDb {
             filter,
             limit,
             offset,
+            true,
         )
     }
 
@@ -956,6 +961,7 @@ impl PieskieoDb {
             filter,
             limit,
             offset,
+            false,
         )
     }
 
@@ -2366,76 +2372,94 @@ impl PieskieoDb {
         filter: &HashMap<String, Value>,
         limit: usize,
         offset: usize,
+        is_doc: bool,
     ) -> Vec<(Uuid, Value)> {
-        // cost heuristic: intersect equality indexes when available, else scan.
         if let (Some(ns), Some(coll)) = (ns, coll) {
-            if let Some(ns_map) = index.get(ns) {
-                if let Some(col_map) = ns_map.get(coll) {
-                    let total_rows = self
-                        .stats
-                        .read()
+            if let (Some(ns_map), Some(inner)) =
+                (index.get(ns), map.get(ns).and_then(|m| m.get(coll)))
+            {
+                let stats_guard = self.stats.read();
+                let total_rows = if is_doc {
+                    stats_guard
                         .docs
                         .get(ns)
                         .and_then(|m| m.get(coll))
                         .cloned()
-                        .unwrap_or_else(|| {
-                            map.get(ns)
-                                .and_then(|m| m.get(coll))
-                                .map(|m| m.len())
-                                .unwrap_or(0)
-                        });
-                    let mut candidate: Option<Vec<Uuid>> = None;
-                    for (field, val) in filter.iter() {
-                        if let Some(key) = Self::index_key(val) {
-                            if let Some(field_map) = col_map.get(field) {
-                                if let Some(ids) = field_map.get(&key) {
-                                    let ids = ids.clone();
-                                    candidate = Some(match candidate.take() {
-                                        None => ids,
-                                        Some(prev) => {
-                                            let set: std::collections::HashSet<Uuid> =
-                                                prev.into_iter().collect();
-                                            ids.into_iter().filter(|i| set.contains(i)).collect()
+                        .unwrap_or_else(|| inner.len())
+                } else {
+                    stats_guard
+                        .rows
+                        .get(ns)
+                        .and_then(|m| m.get(coll))
+                        .cloned()
+                        .unwrap_or_else(|| inner.len())
+                };
+
+                // choose smallest equality-bucket among predicates
+                let mut best: Option<(String, usize, Vec<Uuid>)> = None;
+                for (field, val) in filter.iter() {
+                    if let Some(key) = Self::index_key(val) {
+                        if let Some(field_map) = ns_map.get(coll).and_then(|m| m.get(field)) {
+                            if let Some(ids) = field_map.get(&key) {
+                                let bucket = ids.clone();
+                                let cost = bucket.len();
+                                if cost < total_rows {
+                                    match &best {
+                                        None => best = Some((field.clone(), cost, bucket)),
+                                        Some((_, best_cost, _)) if cost < *best_cost => {
+                                            best = Some((field.clone(), cost, bucket))
                                         }
-                                    });
-                                }
-                            }
-                        }
-                    }
-                    if let Some(ids) = candidate {
-                        if let Some(inner) = map.get(ns).and_then(|m| m.get(coll)) {
-                            let estimated = ids.len();
-                            let threshold = (total_rows / 2).max(10);
-                            // use index only if estimated hit count is lower than threshold
-                            if estimated <= threshold {
-                                let mut out = Vec::new();
-                                let mut skipped = 0usize;
-                                for id in ids {
-                                    if !self.owns(&id) {
-                                        continue;
-                                    }
-                                    if let Some(v) = inner.get(&id) {
-                                        if !value_matches(v, filter) {
-                                            continue;
-                                        }
-                                        if skipped < offset {
-                                            skipped += 1;
-                                            continue;
-                                        }
-                                        out.push((id, v.clone()));
-                                        if out.len() >= limit {
-                                            return out;
-                                        }
+                                        _ => {}
                                     }
                                 }
-                                return out;
                             }
                         }
                     }
                 }
+
+                if let Some((field, cost, bucket)) = best {
+                    tracing::debug!(
+                        target: "planner",
+                        namespace=%ns,
+                        collection=%coll,
+                        field=%field,
+                        bucket=cost,
+                        total=total_rows,
+                        "chosen equality index path"
+                    );
+
+                    let mut out = Vec::new();
+                    let mut skipped = 0usize;
+                    for id in bucket {
+                        if !self.owns(&id) {
+                            continue;
+                        }
+                        if let Some(v) = inner.get(&id) {
+                            if !value_matches(v, filter) {
+                                continue;
+                            }
+                            if skipped < offset {
+                                skipped += 1;
+                                continue;
+                            }
+                            out.push((id, v.clone()));
+                            if out.len() >= limit {
+                                return out;
+                            }
+                        }
+                    }
+                    return out;
+                } else {
+                    tracing::debug!(
+                        target: "planner",
+                        namespace=%ns,
+                        collection=%coll,
+                        total=total_rows,
+                        "no selective index found, full scan"
+                    );
+                }
             }
         }
-        // fallback full scan
         self.filter_map(map, ns, coll, filter, limit, offset)
     }
 

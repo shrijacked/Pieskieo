@@ -33,7 +33,9 @@ use serde::{Deserialize, Serialize};
 use sqlparser::{dialect::GenericDialect, parser::Parser};
 use std::path::PathBuf;
 use tokio::{net::TcpListener, sync::RwLock};
-use tracing_subscriber::EnvFilter;
+use tracing_appender::rolling;
+use tracing_subscriber::{EnvFilter, prelude::*};
+use tracing_subscriber::fmt::writer::MakeWriterExt;
 use uuid::Uuid;
 
 #[cfg(feature = "tls")]
@@ -53,7 +55,16 @@ struct AppState {
     audit: Arc<AuditLog>,
     data_dir: String,
     pause_writes: Arc<AtomicBool>,
-    reshard_status: Arc<RwLock<Option<String>>>,
+    reshard_status: Arc<RwLock<Option<ReshardReport>>>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ReshardReport {
+    status: String,
+    paused: bool,
+    verified: bool,
+    before_counts: HashMap<usize, usize>,
+    after_counts: HashMap<usize, usize>,
 }
 
 #[derive(Clone)]
@@ -552,7 +563,7 @@ struct ReshardRequest {
 
 #[derive(Serialize)]
 struct ReshardStatus {
-    status: Option<String>,
+    status: Option<ReshardReport>,
     paused: bool,
 }
 #[derive(Deserialize)]
@@ -644,6 +655,15 @@ impl DbPool {
         self.shards.iter().cloned()
     }
 
+    fn counts(&self) -> HashMap<usize, usize> {
+        let mut out = HashMap::new();
+        for shard in &self.shards {
+            let m = shard.metrics();
+            out.insert(shard.shard_id(), m.docs + m.rows);
+        }
+        out
+    }
+
     fn aggregate_metrics(&self) -> pieskieo_core::engine::MetricsSnapshot {
         let mut agg = pieskieo_core::engine::MetricsSnapshot {
             docs: 0,
@@ -692,11 +712,9 @@ impl DbPool {
 }
 
 pub async fn serve() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
+    let data_dir = std::env::var("PIESKIEO_DATA").unwrap_or_else(|_| default_data_dir());
+    init_logging(&data_dir);
 
-    let data_dir = std::env::var("PIESKIEO_DATA").unwrap_or_else(|_| "data".to_string());
     let auth = Arc::new(RwLock::new(AuthConfig::from_env(&data_dir)));
     let params = vector_params_from_env();
     let shards = params.shard_total.max(1);
@@ -912,6 +930,53 @@ fn vector_params_from_env() -> PieskieoVectorParams {
         shard_id,
         shard_total,
     }
+}
+
+fn default_data_dir() -> String {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var("APPDATA")
+            .map(|p| format!("{p}\\Pieskieo"))
+            .unwrap_or_else(|_| "C:\\ProgramData\\Pieskieo".into())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        "/var/lib/pieskieo".into()
+    }
+}
+
+fn init_logging(data_dir: &str) {
+    let mode = std::env::var("PIESKIEO_LOG_MODE").unwrap_or_else(|_| "stdout".into());
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+    let log_dir = std::env::var("PIESKIEO_LOG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(data_dir).join("logs"));
+    let file_appender = rolling::daily(log_dir, "pieskieo.log");
+    let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
+    Box::leak(Box::new(guard));
+    let writer: tracing_subscriber::fmt::writer::BoxMakeWriter = match mode.as_str() {
+        "file" => tracing_subscriber::fmt::writer::BoxMakeWriter::new(
+            file_writer.with_max_level(tracing::Level::TRACE),
+        ),
+        "both" => tracing_subscriber::fmt::writer::BoxMakeWriter::new(
+            file_writer
+                .and(std::io::stdout)
+                .with_max_level(tracing::Level::TRACE),
+        ),
+        _ => tracing_subscriber::fmt::writer::BoxMakeWriter::new(
+            std::io::stdout.with_max_level(tracing::Level::TRACE),
+        ),
+    };
+
+    let layer = tracing_subscriber::fmt::layer()
+        .with_writer(writer)
+        .with_ansi(mode != "file");
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(layer)
+        .init();
 }
 async fn health() -> &'static str {
     "ok"
@@ -1746,12 +1811,18 @@ async fn reshard(
         .store(true, std::sync::atomic::Ordering::SeqCst);
     {
         let mut s = state.reshard_status.write().await;
-        *s = Some(format!("reshard starting to {} shards", input.shards));
+        *s = Some(ReshardReport {
+            status: format!("reshard starting to {} shards", input.shards),
+            paused: true,
+            verified: false,
+            before_counts: HashMap::new(),
+            after_counts: HashMap::new(),
+        });
     }
     let new_shards = input.shards.max(1);
-    let (wal, template) = {
+    let (wal, template, before_counts) = {
         let guard = state.pool.read().await;
-        (guard.wal_all(), guard.template_params())
+        (guard.wal_all(), guard.template_params(), guard.counts())
     };
     let mut params = template.clone();
     params.shard_total = new_shards;
@@ -1767,12 +1838,20 @@ async fn reshard(
         let mut guard = state.pool.write().await;
         *guard = new_pool;
     }
+    let after_counts = state.pool.read().await.counts();
+    let verified = before_counts.values().sum::<usize>() == after_counts.values().sum::<usize>();
     state
         .pause_writes
         .store(false, std::sync::atomic::Ordering::SeqCst);
     {
         let mut s = state.reshard_status.write().await;
-        *s = Some(format!("reshard complete to {} shards", new_shards));
+        *s = Some(ReshardReport {
+            status: format!("reshard complete to {} shards", new_shards),
+            paused: false,
+            verified,
+            before_counts,
+            after_counts,
+        });
     }
     Ok(Json(ApiResponse {
         ok: true,
