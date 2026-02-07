@@ -8,7 +8,7 @@ use axum::{
     http::Request,
     middleware::{self, Next},
     routing::{delete, get, post},
-    Json, Router,
+    Json, Router, Extension,
 };
 use sqlparser::{dialect::GenericDialect, parser::Parser};
 use futures::future::join_all;
@@ -18,6 +18,7 @@ use pieskieo_core::{
 use serde::{Deserialize, Serialize};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
+use std::path::PathBuf;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -26,12 +27,14 @@ use uuid::Uuid;
 struct AppState {
     pool: Arc<DbPool>,
     auth: Arc<AuthConfig>,
+    data_dir: PathBuf,
 }
 
 #[derive(Clone)]
 struct AuthConfig {
     users: Vec<UserRec>,
     bearer: Option<String>,
+    path: PathBuf,
 }
 
 #[derive(Clone)]
@@ -42,6 +45,7 @@ struct UserRec {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 enum Role {
     Admin,
     Write,
@@ -49,9 +53,10 @@ enum Role {
 }
 
 impl AuthConfig {
-    fn from_env() -> Self {
+    fn from_env(data_dir: &str) -> Self {
         // primary multi-user source: PIESKIEO_USERS as JSON array [{user,pass,role}]
         let mut users = Vec::new();
+        let path = PathBuf::from(data_dir).join("auth_users.json");
         if let Ok(json) = std::env::var("PIESKIEO_USERS") {
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json) {
                 if let Some(arr) = val.as_array() {
@@ -76,19 +81,40 @@ impl AuthConfig {
         }
         // fallback single user env
         if users.is_empty() {
-            if let (Ok(u), Ok(p)) = (
-                std::env::var("PIESKIEO_AUTH_USER"),
-                std::env::var("PIESKIEO_AUTH_PASSWORD"),
-            ) {
-                users.push(UserRec {
-                    user: u,
-                    password: p,
-                    role: Role::Admin,
-                });
+            if let Ok(u) = std::env::var("PIESKIEO_AUTH_USER") {
+                if let Ok(p) = std::env::var("PIESKIEO_AUTH_PASSWORD") {
+                    users.push(UserRec {
+                        user: u,
+                        password: p,
+                        role: Role::Admin,
+                    });
+                }
+            }
+        }
+        // file-based persistent users
+        if users.is_empty() && path.exists() {
+            if let Ok(txt) = std::fs::read_to_string(&path) {
+                if let Ok(arr) = serde_json::from_str::<Vec<UserDisk>>(&txt) {
+                    for u in arr {
+                        users.push(UserRec {
+                            user: u.user,
+                            password: u.pass,
+                            role: Self::parse_role(&u.role),
+                        });
+                    }
+                }
             }
         }
         let bearer = std::env::var("PIESKIEO_TOKEN").ok();
-        Self { users, bearer }
+        // default admin if nothing configured
+        if users.is_empty() && bearer.is_none() {
+            users.push(UserRec {
+                user: "Pieskieo".into(),
+                password: "pieskieo".into(),
+                role: Role::Admin,
+            });
+        }
+        Self { users, bearer, path }
     }
 
     fn enabled(&self) -> bool {
@@ -102,6 +128,34 @@ impl AuthConfig {
             _ => Role::Read,
         }
     }
+
+    fn persist(&self) {
+        let disk: Vec<UserDisk> = self
+            .users
+            .iter()
+            .map(|u| UserDisk {
+                user: u.user.clone(),
+                pass: u.password.clone(),
+                role: match u.role {
+                    Role::Admin => "admin",
+                    Role::Write => "write",
+                    Role::Read => "read",
+                }
+                .to_string(),
+            })
+            .collect();
+        if let Ok(txt) = serde_json::to_string_pretty(&disk) {
+            let _ = std::fs::create_dir_all(self.path.parent().unwrap_or_else(|| std::path::Path::new(".")));
+            let _ = std::fs::write(&self.path, txt);
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct UserDisk {
+    user: String,
+    pass: String,
+    role: String,
 }
 
 #[derive(Deserialize)]
@@ -135,6 +189,13 @@ struct SchemaInput {
     namespace: Option<String>,
     name: String,
     fields: HashMap<String, SchemaField>,
+}
+
+#[derive(Deserialize)]
+struct UserCreateInput {
+    user: String,
+    pass: String,
+    role: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -288,12 +349,12 @@ pub async fn serve() -> anyhow::Result<()> {
         .init();
 
     let data_dir = std::env::var("PIESKIEO_DATA").unwrap_or_else(|_| "data".to_string());
-    let auth = Arc::new(AuthConfig::from_env());
+    let auth = Arc::new(AuthConfig::from_env(&data_dir));
     let params = vector_params_from_env();
     let shards = params.shard_total.max(1);
     let pool = Arc::new(DbPool::new(&data_dir, params, shards)?);
 
-    let state = AppState { pool, auth };
+    let state = AppState { pool, auth, data_dir: data_dir.clone().into() };
 
     // background WAL flusher (group commit) for better latency.
     let flush_ms = std::env::var("PIESKIEO_WAL_FLUSH_MS")
@@ -378,6 +439,8 @@ pub async fn serve() -> anyhow::Result<()> {
         .route("/v1/graph/:id", get(list_neighbors))
         .route("/v1/graph/:id/bfs", get(list_bfs))
         .route("/v1/graph/:id/dfs", get(list_dfs))
+        .route("/v1/auth/users", get(list_users))
+        .route("/v1/auth/users", post(create_user))
         .layer(middleware::from_fn_with_state(
             state.auth.clone(),
             auth_middleware,
@@ -547,8 +610,12 @@ async fn query_docs(
 
 async fn query_sql(
     State(state): State<AppState>,
+    Extension(role): Extension<Role>,
     Json(input): Json<SqlInput>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
+    if !authorize(role, "/v1/sql", "POST") {
+        return Err(ApiError::Forbidden);
+    }
     let dialect = GenericDialect {};
     let ast = Parser::parse_sql(&dialect, &input.sql)
         .map_err(|e: sqlparser::parser::ParserError| ApiError::BadRequest(e.to_string()))?;
@@ -610,8 +677,12 @@ async fn query_sql(
 
 async fn set_schema(
     State(state): State<AppState>,
+    Extension(role): Extension<Role>,
     Json(input): Json<SchemaInput>,
 ) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
+    if !authorize(role, "/v1/schema", "POST") {
+        return Err(ApiError::Forbidden);
+    }
     let def = SchemaDef {
         fields: input.fields,
     };
@@ -1048,6 +1119,8 @@ async fn auth_middleware(
                                 auth.users.iter().find(|usr| usr.user == u && usr.password == p)
                             {
                                 if authorize(user.role, req.uri().path(), req.method().as_str()) {
+                                    let mut req = req;
+                                    req.extensions_mut().insert(user.role);
                                     return Ok(next.run(req).await);
                                 } else {
                                     return Err(ApiError::Forbidden);
@@ -1146,4 +1219,44 @@ impl axum::response::IntoResponse for ApiError {
             }
         }
     }
+}
+async fn list_users(
+    State(state): State<AppState>,
+    Extension(role): Extension<Role>,
+) -> Result<Json<ApiResponse<Vec<String>>>, ApiError> {
+    if !matches!(role, Role::Admin) {
+        return Err(ApiError::Forbidden);
+    }
+    let users = state
+        .auth
+        .users
+        .iter()
+        .map(|u| format!("{} ({:?})", u.user, u.role))
+        .collect();
+    Ok(Json(ApiResponse { ok: true, data: users }))
+}
+
+async fn create_user(
+    State(state): State<AppState>,
+    Extension(role): Extension<Role>,
+    Json(input): Json<UserCreateInput>,
+) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
+    if !matches!(role, Role::Admin) {
+        return Err(ApiError::Forbidden);
+    }
+    let mut auth = state.auth.as_ref().clone();
+    let role = input
+        .role
+        .as_deref()
+        .map(AuthConfig::parse_role)
+        .unwrap_or(Role::Read);
+    auth.users.push(UserRec {
+        user: input.user,
+        password: input.pass,
+        role,
+    });
+    auth.persist();
+    // replace shared auth
+    *Arc::get_mut(&mut Arc::clone(&state.auth)).unwrap() = auth;
+    Ok(Json(ApiResponse { ok: true, data: "created" }))
 }
