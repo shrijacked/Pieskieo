@@ -3,7 +3,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
+    body::Body,
     extract::{Path, Query, State},
+    http::Request,
+    middleware::{self, Next},
     routing::{delete, get, post},
     Json, Router,
 };
@@ -13,6 +16,8 @@ use pieskieo_core::{
     PieskieoDb, PieskieoError, SchemaDef, SchemaField, SqlResult, VectorParams as PieskieoVectorParams,
 };
 use serde::{Deserialize, Serialize};
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -20,6 +25,83 @@ use uuid::Uuid;
 #[derive(Clone)]
 struct AppState {
     pool: Arc<DbPool>,
+    auth: Arc<AuthConfig>,
+}
+
+#[derive(Clone)]
+struct AuthConfig {
+    users: Vec<UserRec>,
+    bearer: Option<String>,
+}
+
+#[derive(Clone)]
+struct UserRec {
+    user: String,
+    password: String,
+    role: Role,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Admin,
+    Write,
+    Read,
+}
+
+impl AuthConfig {
+    fn from_env() -> Self {
+        // primary multi-user source: PIESKIEO_USERS as JSON array [{user,pass,role}]
+        let mut users = Vec::new();
+        if let Ok(json) = std::env::var("PIESKIEO_USERS") {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&json) {
+                if let Some(arr) = val.as_array() {
+                    for item in arr {
+                        if let (Some(u), Some(p)) =
+                            (item.get("user").and_then(|v| v.as_str()), item.get("pass").and_then(|v| v.as_str()))
+                        {
+                            let role = item
+                                .get("role")
+                                .and_then(|v| v.as_str())
+                                .map(Self::parse_role)
+                                .unwrap_or(Role::Read);
+                            users.push(UserRec {
+                                user: u.to_string(),
+                                password: p.to_string(),
+                                role,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        // fallback single user env
+        if users.is_empty() {
+            if let (Ok(u), Ok(p)) = (
+                std::env::var("PIESKIEO_AUTH_USER"),
+                std::env::var("PIESKIEO_AUTH_PASSWORD"),
+            ) {
+                users.push(UserRec {
+                    user: u,
+                    password: p,
+                    role: Role::Admin,
+                });
+            }
+        }
+        let bearer = std::env::var("PIESKIEO_TOKEN").ok();
+        Self { users, bearer }
+    }
+
+    fn enabled(&self) -> bool {
+        !self.users.is_empty() || self.bearer.is_some()
+    }
+
+    fn parse_role(s: &str) -> Role {
+        match s.to_ascii_lowercase().as_str() {
+            "admin" => Role::Admin,
+            "write" | "writer" => Role::Write,
+            _ => Role::Read,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -206,11 +288,12 @@ pub async fn serve() -> anyhow::Result<()> {
         .init();
 
     let data_dir = std::env::var("PIESKIEO_DATA").unwrap_or_else(|_| "data".to_string());
+    let auth = Arc::new(AuthConfig::from_env());
     let params = vector_params_from_env();
     let shards = params.shard_total.max(1);
     let pool = Arc::new(DbPool::new(&data_dir, params, shards)?);
 
-    let state = AppState { pool };
+    let state = AppState { pool, auth };
 
     // background WAL flusher (group commit) for better latency.
     let flush_ms = std::env::var("PIESKIEO_WAL_FLUSH_MS")
@@ -295,6 +378,10 @@ pub async fn serve() -> anyhow::Result<()> {
         .route("/v1/graph/:id", get(list_neighbors))
         .route("/v1/graph/:id/bfs", get(list_bfs))
         .route("/v1/graph/:id/dfs", get(list_dfs))
+        .layer(middleware::from_fn_with_state(
+            state.auth.clone(),
+            auth_middleware,
+        ))
         .with_state(state);
 
     let addr: SocketAddr = std::env::var("PIESKIEO_LISTEN")
@@ -936,12 +1023,96 @@ async fn metrics(
     Ok(resp)
 }
 
+async fn auth_middleware(
+    State(auth): State<Arc<AuthConfig>>,
+    req: Request<Body>,
+    next: Next,
+) -> Result<axum::response::Response, ApiError> {
+    if !auth.enabled() {
+        return Ok(next.run(req).await);
+    }
+    if let Some(header) = req.headers().get(axum::http::header::AUTHORIZATION) {
+        if let Ok(val) = header.to_str() {
+            if let Some(tok) = val.strip_prefix("Bearer ") {
+                if let Some(expected) = &auth.bearer {
+                    if tok == expected {
+                        return Ok(next.run(req).await);
+                    }
+                }
+            }
+            if let Some(basic) = val.strip_prefix("Basic ") {
+                if let Ok(decoded) = B64.decode(basic) {
+                    if let Ok(s) = String::from_utf8(decoded) {
+                        if let Some((u, p)) = s.split_once(':') {
+                            if let Some(user) =
+                                auth.users.iter().find(|usr| usr.user == u && usr.password == p)
+                            {
+                                if authorize(user.role, req.uri().path(), req.method().as_str()) {
+                                    return Ok(next.run(req).await);
+                                } else {
+                                    return Err(ApiError::Forbidden);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Err(ApiError::Unauthorized)
+}
+
+fn authorize(role: Role, path: &str, method: &str) -> bool {
+    use Role::*;
+    if matches!(role, Admin) {
+        return true;
+    }
+    let is_read = is_read_path(path, method);
+    match role {
+        Read => is_read,
+        Write => is_read || is_write_path(path, method),
+        Admin => true,
+    }
+}
+
+fn is_read_path(path: &str, method: &str) -> bool {
+    if path == "/healthz" || path == "/metrics" {
+        return true;
+    }
+    let m = method.to_uppercase();
+    if m == "GET" {
+        return true;
+    }
+    // vector search is POST but read
+    if path.contains("/vector/search") && m == "POST" {
+        return true;
+    }
+    if path.contains("/graph") && m == "GET" {
+        return true;
+    }
+    false
+}
+
+fn is_write_path(path: &str, method: &str) -> bool {
+    let m = method.to_uppercase();
+    if m == "POST" || m == "DELETE" || m == "PUT" || m == "PATCH" {
+        return true;
+    }
+    // SQL endpoint treated as write by default
+    if path.contains("/v1/sql") {
+        return true;
+    }
+    false
+}
+
 #[derive(Debug)]
 enum ApiError {
     NotFound,
     WrongShard,
     BadRequest(String),
     Conflict(String),
+    Unauthorized,
+    Forbidden,
     Internal(anyhow::Error),
 }
 
@@ -967,6 +1138,8 @@ impl axum::response::IntoResponse for ApiError {
             ApiError::WrongShard => StatusCode::CONFLICT.into_response(),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
+            ApiError::Unauthorized => StatusCode::UNAUTHORIZED.into_response(),
+            ApiError::Forbidden => StatusCode::FORBIDDEN.into_response(),
             ApiError::Internal(err) => {
                 tracing::error!("api_error" = %err);
                 StatusCode::INTERNAL_SERVER_ERROR.into_response()

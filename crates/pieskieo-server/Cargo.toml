@@ -21,3 +21,4 @@ futures = "0.3"
 reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
 rand.workspace = true
 sqlparser.workspace = true
+base64 = "0.21"

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use pieskieo_core::{PieskieoDb, VectorParams};
+use pieskieo_core::{PieskieoDb, VectorParams, SqlResult};
 use pieskieo_server;
 use serde_json::Value;
 use serde::Deserialize;
@@ -30,7 +30,7 @@ struct Cli {
     #[arg(long, default_value = "0.0.0.0:8000")]
     listen: String,
 
-    /// Start interactive shell (embedded mode)
+    /// Start interactive shell (embedded mode or network, see --server-url)
     #[arg(long)]
     repl: bool,
 
@@ -40,6 +40,24 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Connect to a server and open an interactive PQL shell (psql-like)
+    Connect {
+        #[arg(short = 'H', long, default_value = "localhost")]
+        host: String,
+        #[arg(short = 'p', long, default_value_t = 8000)]
+        port: u16,
+        #[arg(short = 'U', long)]
+        user: Option<String>,
+        /// Prompt for password
+        #[arg(short = 'W', long, action = clap::ArgAction::SetTrue)]
+        prompt_password: bool,
+        /// Password inline (discouraged; overrides prompt)
+        #[arg(short = 'P', long)]
+        password: Option<String>,
+        /// Bearer token; if omitted, PIESKIEO_TOKEN env is used. If set, overrides password.
+        #[arg(short = 't', long)]
+        token: Option<String>,
+    },
     /// Insert/update a document
     PutDoc {
         #[arg(long)]
@@ -104,20 +122,7 @@ fn main() -> Result<()> {
 
     // network mode
     if let Some(base_url) = cli.server_url.clone() {
-        let token = std::env::var("PIESKIEO_TOKEN").ok();
-        let client = reqwest::blocking::Client::builder()
-            .user_agent("pieskieo-cli")
-            .build()?;
-        if cli.repl || matches!(cli.command, Some(Commands::Repl)) || cli.command.is_none() {
-            return run_net_repl(&client, &base_url, token.as_deref());
-        }
-        if let Some(Commands::Sql { sql }) = cli.command {
-            let data = net_query_sql(&client, &base_url, token.as_deref(), &sql)?;
-            println!("{}", data);
-            return Ok(());
-        }
-        println!("In network mode (--server-url). Use --repl or Sql command.");
-        return Ok(());
+        return run_network_mode(cli, &base_url);
     }
 
     // embedded mode
@@ -129,6 +134,36 @@ fn main() -> Result<()> {
     }
 
     match cli.command {
+        Some(Commands::Connect {
+            host,
+            port,
+            user,
+            prompt_password,
+            password,
+            token,
+        }) => {
+            let base_url = format!("http://{host}:{port}");
+            let token = token.or_else(|| std::env::var("PIESKIEO_TOKEN").ok());
+            let mut pass = password;
+            if prompt_password && pass.is_none() {
+                let p = rpassword::prompt_password("Password: ")?;
+                pass = Some(p);
+            }
+            let client = reqwest::blocking::Client::builder()
+                .user_agent("pieskieo-cli")
+                .build()?;
+            return run_net_repl_with_prompt(
+                &client,
+                &base_url,
+                AuthOpt {
+                    bearer: token.clone(),
+                    basic_user: user.clone(),
+                    basic_pass: pass.clone(),
+                },
+                Some(user.unwrap_or_else(|| "anon".into())),
+                Some(format!("{host}:{port}")),
+            );
+        }
         Some(Commands::PutDoc {
             id,
             json,
@@ -207,8 +242,53 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn run_network_mode(cli: Cli, base_url: &str) -> Result<()> {
+    let token = std::env::var("PIESKIEO_TOKEN").ok();
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("pieskieo-cli")
+        .build()?;
+    match cli.command {
+        Some(Commands::Sql { sql }) => {
+            let data = net_query_sql(
+                &client,
+                base_url,
+                AuthOpt {
+                    bearer: token.clone(),
+                    basic_user: None,
+                    basic_pass: None,
+                },
+                &sql,
+            )?;
+            println!("{}", data);
+            Ok(())
+        }
+        Some(Commands::Repl) | None if cli.repl || cli.command.is_none() => {
+            run_net_repl(
+                &client,
+                base_url,
+                AuthOpt {
+                    bearer: token,
+                    basic_user: None,
+                    basic_pass: None,
+                },
+            )
+        }
+        Some(Commands::PutDoc { .. })
+        | Some(Commands::QueryDoc { .. })
+        | Some(Commands::PutVector { .. })
+        | Some(Commands::SearchVector { .. }) => {
+            println!("Use the SQL or REPL commands in network mode.");
+            Ok(())
+        }
+        _ => {
+            println!("Network mode supports Sql and Repl. Use --repl or --command Sql.");
+            Ok(())
+        }
+    }
+}
+
 fn run_repl(db: PieskieoDb) -> Result<()> {
-    println!("Pieskieo shell. Commands: doc.put <json>, doc.get <uuid>, row.put <json>, row.get <uuid>, vec.put <list>, vec.search <list> [k], quit.");
+    println!("Pieskieo embedded shell (PQL-lite + shortcuts). Type `help` for commands or enter raw PQL SELECT/INSERT/UPDATE/DELETE. quit/exit to leave.");
     loop {
         print!("pieskieo> ");
         io::stdout().flush()?;
@@ -223,101 +303,138 @@ fn run_repl(db: PieskieoDb) -> Result<()> {
         if line == "quit" || line == "exit" {
             break;
         }
-        let mut parts = line.split_whitespace();
-        let cmd = parts.next().unwrap_or("");
-        match cmd {
-            "doc.put" => {
-                if let Some(json_str) = parts.next() {
-                    let val: Value = serde_json::from_str(json_str)?;
-                    let id = uuid::Uuid::new_v4();
-                    db.put_doc(id, val)?;
-                    println!("{}", id);
-                } else {
-                    println!("usage: doc.put {{json}}");
-                }
-            }
-            "doc.get" => {
-                if let Some(id_str) = parts.next() {
-                    let id = uuid::Uuid::parse_str(id_str)?;
-                    match db.get_doc(&id) {
-                        Some(v) => println!("{v}"),
-                        None => println!("not found"),
-                    }
-                } else {
-                    println!("usage: doc.get <uuid>");
-                }
-            }
-            "row.put" => {
-                if let Some(json_str) = parts.next() {
-                    let val: Value = serde_json::from_str(json_str)?;
-                    let id = uuid::Uuid::new_v4();
-                    db.put_row(id, &val)?;
-                    println!("{}", id);
-                } else {
-                    println!("usage: row.put {{json}}");
-                }
-            }
-            "row.get" => {
-                if let Some(id_str) = parts.next() {
-                    let id = uuid::Uuid::parse_str(id_str)?;
-                    match db.get_row(&id) {
-                        Some(v) => println!("{v}"),
-                        None => println!("not found"),
-                    }
-                } else {
-                    println!("usage: row.get <uuid>");
-                }
-            }
-            "vec.put" => {
-                if let Some(list) = parts.next() {
-                    let vals: Vec<f32> = list
-                        .trim_matches(&['[', ']'][..])
-                        .split(',')
-                        .filter_map(|s| s.trim().parse().ok())
-                        .collect();
-                    let id = uuid::Uuid::new_v4();
-                    db.put_vector(id, vals)?;
-                    println!("{}", id);
-                } else {
-                    println!("usage: vec.put [0.1,0.2,...]");
-                }
-            }
-            "vec.search" => {
-                if let Some(list) = parts.next() {
-                    let vals: Vec<f32> = list
-                        .trim_matches(&['[', ']'][..])
-                        .split(',')
-                        .filter_map(|s| s.trim().parse().ok())
-                        .collect();
-                    let k: usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(5);
-                    let hits = db.search_vector(&vals, k)?;
-                    for h in hits {
-                        println!("{}\t{}", h.id, h.score);
-                    }
-                } else {
-                    println!("usage: vec.search [0.1,0.2,...] [k]");
-                }
-            }
-            _ => println!("unknown command"),
+        if run_repl_command(&db, line.to_string())? {
+            continue;
         }
     }
     Ok(())
 }
 
-fn net_query_sql(
-    client: &Client,
-    base: &str,
-    token: Option<&str>,
-    sql: &str,
-) -> Result<String> {
+fn run_repl_command(db: &PieskieoDb, line: String) -> Result<bool> {
+    let trimmed = line.trim();
+        if trimmed.eq_ignore_ascii_case("help") {
+            println!("Commands:\n  doc.put <json>\n  doc.get <uuid>\n  row.put <json>\n  row.get <uuid>\n  vec.put [0.1,0.2,...]\n  vec.search [0.1,0.2,...] [k]\nOr enter raw PQL like: SELECT * FROM default.people WHERE age > 20 LIMIT 5;");
+            return Ok(true);
+        }
+    if trimmed.is_empty() {
+        return Ok(true);
+    }
+    if trimmed.ends_with(';') || trimmed.to_uppercase().starts_with("SELECT") || trimmed.to_uppercase().starts_with("INSERT") || trimmed.to_uppercase().starts_with("UPDATE") || trimmed.to_uppercase().starts_with("DELETE") {
+        match db.query_sql(trimmed.trim_end_matches(';'))? {
+            SqlResult::Select(rows) => {
+                for (id, v) in rows {
+                    println!("{}\t{}", id, v);
+                }
+            }
+            SqlResult::Insert { ids } => {
+                for id in ids {
+                    println!("{id}");
+                }
+            }
+            SqlResult::Update { affected } | SqlResult::Delete { affected } => {
+                println!("affected: {affected}");
+            }
+        }
+        return Ok(true);
+    }
+    let mut parts = trimmed.split_whitespace();
+    let cmd = parts.next().unwrap_or("");
+    match cmd {
+        "doc.put" => {
+            if let Some(json_str) = parts.next() {
+                let val: Value = serde_json::from_str(json_str)?;
+                let id = uuid::Uuid::new_v4();
+                db.put_doc(id, val)?;
+                println!("{}", id);
+            } else {
+                println!("usage: doc.put {{json}}");
+            }
+        }
+        "doc.get" => {
+            if let Some(id_str) = parts.next() {
+                let id = uuid::Uuid::parse_str(id_str)?;
+                match db.get_doc(&id) {
+                    Some(v) => println!("{v}"),
+                    None => println!("not found"),
+                }
+            } else {
+                println!("usage: doc.get <uuid>");
+            }
+        }
+        "row.put" => {
+            if let Some(json_str) = parts.next() {
+                let val: Value = serde_json::from_str(json_str)?;
+                let id = uuid::Uuid::new_v4();
+                db.put_row(id, &val)?;
+                println!("{}", id);
+            } else {
+                println!("usage: row.put {{json}}");
+            }
+        }
+        "row.get" => {
+            if let Some(id_str) = parts.next() {
+                let id = uuid::Uuid::parse_str(id_str)?;
+                match db.get_row(&id) {
+                    Some(v) => println!("{v}"),
+                    None => println!("not found"),
+                }
+            } else {
+                println!("usage: row.get <uuid>");
+            }
+        }
+        "vec.put" => {
+            if let Some(list) = parts.next() {
+                let vals: Vec<f32> = list
+                    .trim_matches(&['[', ']'][..])
+                    .split(',')
+                    .filter_map(|s| s.trim().parse().ok())
+                    .collect();
+                let id = uuid::Uuid::new_v4();
+                db.put_vector(id, vals)?;
+                println!("{}", id);
+            } else {
+                println!("usage: vec.put [0.1,0.2,...]");
+            }
+        }
+        "vec.search" => {
+            if let Some(list) = parts.next() {
+                let vals: Vec<f32> = list
+                    .trim_matches(&['[', ']'][..])
+                    .split(',')
+                    .filter_map(|s| s.trim().parse().ok())
+                    .collect();
+                let k: usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(5);
+                let hits = db.search_vector(&vals, k)?;
+                for h in hits {
+                    println!("{}\t{}", h.id, h.score);
+                }
+            } else {
+                println!("usage: vec.search [0.1,0.2,...] [k]");
+            }
+        }
+        _ => println!("unknown command; type help"),
+    }
+    Ok(true)
+}
+
+#[derive(Clone, Default)]
+struct AuthOpt {
+    bearer: Option<String>,
+    basic_user: Option<String>,
+    basic_pass: Option<String>,
+}
+
+fn net_query_sql(client: &Client, base: &str, auth: AuthOpt, sql: &str) -> Result<String> {
     #[derive(Deserialize)]
     struct Resp {
         ok: bool,
         data: serde_json::Value,
     }
     let mut req = client.post(format!("{}/v1/sql", base)).json(&serde_json::json!({ "sql": sql }));
-    if let Some(t) = token {
+    if let Some(t) = auth.bearer {
         req = req.bearer_auth(t);
+    } else if let Some(user) = auth.basic_user {
+        req = req.basic_auth(user, auth.basic_pass);
     }
     let resp = req.send()?.error_for_status()?;
     let parsed: Resp = resp.json()?;
@@ -327,9 +444,23 @@ fn net_query_sql(
     Ok(serde_json::to_string_pretty(&parsed.data)?)
 }
 
-fn run_net_repl(client: &Client, base: &str, token: Option<&str>) -> Result<()> {
+fn run_net_repl(client: &Client, base: &str, auth: AuthOpt) -> Result<()> {
+    run_net_repl_with_prompt(client, base, auth, None, None)
+}
+
+fn run_net_repl_with_prompt(
+    client: &Client,
+    base: &str,
+    auth: AuthOpt,
+    user: Option<String>,
+    target: Option<String>,
+) -> Result<()> {
     let mut rl = DefaultEditor::new().ok();
-    println!("Pieskieo network shell. Type SQL/PQL statements; 'quit' to exit.");
+    let target_disp = target.unwrap_or_else(|| base.to_string());
+    let user_disp = user.unwrap_or_else(|| "anon".into());
+    println!(
+        "Pieskieo network shell connected to {target_disp} as {user_disp}. Type SQL/PQL statements; 'quit' to exit."
+    );
     loop {
         let prompt = "pieskieo(net)> ";
         let line = if let Some(ref mut editor) = rl {
@@ -357,7 +488,7 @@ fn run_net_repl(client: &Client, base: &str, token: Option<&str>) -> Result<()> 
             break;
         }
         let start = Instant::now();
-        match net_query_sql(client, base, token, line) {
+        match net_query_sql(client, base, auth.clone(), line) {
             Ok(out) => {
                 let elapsed = start.elapsed();
                 println!("{out}\n({:.2?})", elapsed);
