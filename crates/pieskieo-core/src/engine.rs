@@ -358,6 +358,14 @@ impl PieskieoDb {
         self.graph.neighbors(id, limit)
     }
 
+    pub fn bfs(&self, start: Uuid, limit: usize) -> Vec<crate::graph::Edge> {
+        self.graph.bfs(start, limit)
+    }
+
+    pub fn dfs(&self, start: Uuid, limit: usize) -> Vec<crate::graph::Edge> {
+        self.graph.dfs(start, limit)
+    }
+
     pub fn rebuild_vectors(&self) -> Result<()> {
         self.vectors.rebuild_hnsw()
     }

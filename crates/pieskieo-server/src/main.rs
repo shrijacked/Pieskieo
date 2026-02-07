@@ -249,6 +249,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/metrics", get(metrics))
         .route("/v1/graph/edge", post(add_edge))
         .route("/v1/graph/:id", get(list_neighbors))
+        .route("/v1/graph/:id/bfs", get(list_bfs))
+        .route("/v1/graph/:id/dfs", get(list_dfs))
         .with_state(state);
 
     let addr: SocketAddr = std::env::var("PIESKIEO_LISTEN")
@@ -629,6 +631,22 @@ async fn list_neighbors(
         ok: true,
         data: edges,
     }))
+}
+
+async fn list_bfs(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ApiResponse<Vec<pieskieo_core::Edge>>>, ApiError> {
+    let edges = state.pool.shard_for(&id).bfs(id, 100);
+    Ok(Json(ApiResponse { ok: true, data: edges }))
+}
+
+async fn list_dfs(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ApiResponse<Vec<pieskieo_core::Edge>>>, ApiError> {
+    let edges = state.pool.shard_for(&id).dfs(id, 100);
+    Ok(Json(ApiResponse { ok: true, data: edges }))
 }
 
 async fn which_shard(

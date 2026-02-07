@@ -37,4 +37,44 @@ impl GraphStore {
             .map(|edges| edges.iter().take(limit).cloned().collect())
             .unwrap_or_default()
     }
+
+    pub fn bfs(&self, start: Uuid, limit: usize) -> Vec<Edge> {
+        let mut visited = std::collections::HashSet::new();
+        let mut queue = std::collections::VecDeque::new();
+        let mut out = Vec::new();
+        queue.push_back(start);
+        visited.insert(start);
+        while let Some(node) = queue.pop_front() {
+            for e in self.neighbors(node, limit) {
+                if visited.insert(e.dst) {
+                    out.push(e.clone());
+                    if out.len() >= limit {
+                        return out;
+                    }
+                    queue.push_back(e.dst);
+                }
+            }
+        }
+        out
+    }
+
+    pub fn dfs(&self, start: Uuid, limit: usize) -> Vec<Edge> {
+        let mut visited = std::collections::HashSet::new();
+        let mut stack = Vec::new();
+        let mut out = Vec::new();
+        stack.push(start);
+        while let Some(node) = stack.pop() {
+            if !visited.insert(node) {
+                continue;
+            }
+            for e in self.neighbors(node, limit).into_iter().rev() {
+                out.push(e.clone());
+                if out.len() >= limit {
+                    return out;
+                }
+                stack.push(e.dst);
+            }
+        }
+        out
+    }
 }

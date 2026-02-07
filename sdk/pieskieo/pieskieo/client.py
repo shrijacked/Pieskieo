@@ -115,6 +115,22 @@ class PieskieoClient:
             return data[:limit]
         return data
 
+    def bfs(self, id: uuid.UUID, limit: int = 100):
+        r = self.client.get(f"{self.base}/v1/graph/{id}/bfs")
+        r.raise_for_status()
+        data = r.json()["data"]
+        if limit and len(data) > limit:
+            return data[:limit]
+        return data
+
+    def dfs(self, id: uuid.UUID, limit: int = 100):
+        r = self.client.get(f"{self.base}/v1/graph/{id}/dfs")
+        r.raise_for_status()
+        data = r.json()["data"]
+        if limit and len(data) > limit:
+            return data[:limit]
+        return data
+
     def close(self):
         self.client.close()
 
