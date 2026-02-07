@@ -5,7 +5,8 @@ set -euo pipefail
 # Usage: curl -fsSL https://raw.githubusercontent.com/DarsheeeGamer/Pieskieo/main/install/get-pieskieo.sh | bash
 # Optional env:
 #   PIESKIEO_VERSION   tag to install (default: latest)
-#   PIESKIEO_PREFIX    install prefix (default: /usr/local if writable, else ~/.local)
+#   PIESKIEO_PREFIX    install prefix (default: /usr/local if writable or when service enabled, else ~/.local)
+#   PIESKIEO_SERVICE   set to "1" to install/run as systemd service (Linux, requires sudo)
 
 choose_prefix() {
   if [[ -n "${PIESKIEO_PREFIX:-}" ]]; then
@@ -13,7 +14,7 @@ choose_prefix() {
     echo "${PIESKIEO_PREFIX}"
     return
   fi
-  if [[ -w /usr/local/bin ]]; then
+  if [[ -w /usr/local/bin || "${PIESKIEO_SERVICE:-0}" = "1" ]]; then
     echo "[installer] /usr/local/bin writable; using /usr/local"
     echo "/usr/local"
   else
@@ -109,6 +110,36 @@ main() {
   echo "[installer] contents installed to $bindst:"
   ls "$bindst"/pieskieo*
   echo "[installer] done. Ensure $bindst is on your PATH."
+
+  if [[ "$(uname -s)" == "Linux" && "${PIESKIEO_SERVICE:-0}" = "1" ]]; then
+    if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+      echo "[installer] ERROR: PIESKIEO_SERVICE=1 requires sudo/root; rerun with sudo." >&2
+      exit 1
+    fi
+    echo "[installer] configuring systemd service pieskieo"
+    mkdir -p /var/lib/pieskieo
+    cat >/etc/systemd/system/pieskieo.service <<'EOF'
+[Unit]
+Description=Pieskieo Database Service
+After=network.target
+
+[Service]
+Type=simple
+Environment=PIESKIEO_DATA=/var/lib/pieskieo
+Environment=PIESKIEO_LISTEN=0.0.0.0:8000
+ExecStart=/usr/local/bin/pieskieo-server --serve
+Restart=on-failure
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable pieskieo.service
+    systemctl restart pieskieo.service
+    echo "[installer] service pieskieo enabled and started"
+  fi
 }
 
 main "$@"
