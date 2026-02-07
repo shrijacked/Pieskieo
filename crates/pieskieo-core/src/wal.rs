@@ -109,6 +109,35 @@ impl Wal {
         Ok(res)
     }
 
+    /// Return WAL length in bytes.
+    pub fn len(&self) -> Result<u64> {
+        Ok(std::fs::metadata(&self.path)?.len())
+    }
+
+    /// Replay records starting at a byte offset (aligned to record boundary).
+    pub fn replay_since(&self, offset: u64) -> Result<(Vec<RecordKind>, u64)> {
+        let mut res = Vec::new();
+        let file = OpenOptions::new().read(true).open(&self.path)?;
+        let mut reader = BufReader::new(file);
+        reader.seek(SeekFrom::Start(offset))?;
+        loop {
+            let mut len_buf = [0u8; 4];
+            if let Err(e) = reader.read_exact(&mut len_buf) {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    break;
+                }
+                return Err(e.into());
+            }
+            let len = u32::from_le_bytes(len_buf) as usize;
+            let mut data = vec![0u8; len];
+            reader.read_exact(&mut data)?;
+            let record: RecordKind = bincode::deserialize(&data)?;
+            res.push(record);
+        }
+        let end = reader.seek(SeekFrom::Current(0))?;
+        Ok((res, end))
+    }
+
     pub fn truncate(&mut self) -> Result<()> {
         let mut file = OpenOptions::new().write(true).open(&self.path)?;
         file.set_len(0)?;

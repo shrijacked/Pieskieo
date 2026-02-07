@@ -2308,38 +2308,51 @@ impl PieskieoDb {
         limit: usize,
         offset: usize,
     ) -> Vec<(Uuid, Value)> {
-        // attempt index if single namespace+collection specified and single equality filter
+        // cost heuristic: intersect equality indexes when available, else scan.
         if let (Some(ns), Some(coll)) = (ns, coll) {
-            if filter.len() == 1 {
-                if let Some((fk, fv)) = filter.iter().next() {
-                    if let Some(key) = Self::index_key(fv) {
-                        if let Some(ns_map) = index.get(ns) {
-                            if let Some(col_map) = ns_map.get(coll) {
-                                if let Some(field_map) = col_map.get(fk) {
-                                    if let Some(ids) = field_map.get(&key) {
-                                        if let Some(inner) = map.get(ns).and_then(|m| m.get(coll)) {
-                                            let mut out = Vec::new();
-                                            let mut skipped = 0usize;
-                                            for id in ids {
-                                                if !self.owns(id) {
-                                                    continue;
-                                                }
-                                                if let Some(v) = inner.get(id) {
-                                                    if skipped < offset {
-                                                        skipped += 1;
-                                                        continue;
-                                                    }
-                                                    out.push((*id, v.clone()));
-                                                    if out.len() >= limit {
-                                                        return out;
-                                                    }
-                                                }
-                                            }
-                                            return out;
+            if let Some(ns_map) = index.get(ns) {
+                if let Some(col_map) = ns_map.get(coll) {
+                    let mut candidate: Option<Vec<Uuid>> = None;
+                    for (field, val) in filter.iter() {
+                        if let Some(key) = Self::index_key(val) {
+                            if let Some(field_map) = col_map.get(field) {
+                                if let Some(ids) = field_map.get(&key) {
+                                    let ids = ids.clone();
+                                    candidate = Some(match candidate.take() {
+                                        None => ids,
+                                        Some(prev) => {
+                                            let set: std::collections::HashSet<Uuid> =
+                                                prev.into_iter().collect();
+                                            ids.into_iter().filter(|i| set.contains(i)).collect()
                                         }
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    if let Some(ids) = candidate {
+                        if let Some(inner) = map.get(ns).and_then(|m| m.get(coll)) {
+                            let mut out = Vec::new();
+                            let mut skipped = 0usize;
+                            for id in ids {
+                                if !self.owns(&id) {
+                                    continue;
+                                }
+                                if let Some(v) = inner.get(&id) {
+                                    if !value_matches(v, filter) {
+                                        continue;
+                                    }
+                                    if skipped < offset {
+                                        skipped += 1;
+                                        continue;
+                                    }
+                                    out.push((id, v.clone()));
+                                    if out.len() >= limit {
+                                        return out;
                                     }
                                 }
                             }
+                            return out;
                         }
                     }
                 }
