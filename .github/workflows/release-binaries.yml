@@ -62,13 +62,13 @@ jobs:
           mkdir -p dist
           BIN_DIR=target/${{ matrix.target }}/release
           VERSION=${GITHUB_REF_NAME}
-          ARCHIVE=pieskieo-${{ matrix.archive }}-${VERSION}.zip
-          zip -j dist/$ARCHIVE \
-            "$BIN_DIR/pieskieo${{ matrix.bin-suffix }}" \
-            "$BIN_DIR/pieskieo-server${{ matrix.bin-suffix }}" \
-            "$BIN_DIR/load${{ matrix.bin-suffix }}" \
-            "$BIN_DIR/bench${{ matrix.bin-suffix }}"
-          echo "ARCHIVE=$ARCHIVE" >> $GITHUB_ENV
+          ARCHIVE="pieskieo-${{ matrix.archive }}-${VERSION}.zip"
+          zip -j "dist/${ARCHIVE}" \
+            "${BIN_DIR}/pieskieo${{ matrix.bin-suffix }}" \
+            "${BIN_DIR}/pieskieo-server${{ matrix.bin-suffix }}" \
+            "${BIN_DIR}/load${{ matrix.bin-suffix }}" \
+            "${BIN_DIR}/bench${{ matrix.bin-suffix }}"
+          echo "ARCHIVE=${ARCHIVE}" >> $GITHUB_ENV
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
