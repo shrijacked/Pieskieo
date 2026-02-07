@@ -33,6 +33,7 @@ pub struct PieskieoDb {
     path: PathBuf,
     pub(crate) wal: RwLock<Wal>,
     pub(crate) data: Arc<RwLock<Collections>>,
+    stats: Arc<RwLock<Stats>>,
     // namespace -> vector index
     pub(crate) vectors: Arc<RwLock<HashMap<String, Arc<VectorIndex>>>>,
     // vector id -> namespace (for auto-link + delete convenience)
@@ -57,6 +58,12 @@ pub struct SchemaField {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SchemaDef {
     pub fields: HashMap<String, SchemaField>,
+}
+
+#[derive(Default, Clone, Serialize, Deserialize, Debug)]
+pub struct Stats {
+    docs: HashMap<String, HashMap<String, usize>>,
+    rows: HashMap<String, HashMap<String, usize>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -114,6 +121,36 @@ impl PieskieoDb {
             )?;
         }
         Ok(())
+    }
+
+    fn bump_doc_stats(&self, ns: &str, coll: &str, delta: i64) {
+        let mut stats = self.stats.write();
+        let entry = stats
+            .docs
+            .entry(ns.to_string())
+            .or_default()
+            .entry(coll.to_string())
+            .or_default();
+        if delta.is_negative() {
+            *entry = entry.saturating_sub(delta.unsigned_abs() as usize);
+        } else {
+            *entry += delta as usize;
+        }
+    }
+
+    fn bump_row_stats(&self, ns: &str, tbl: &str, delta: i64) {
+        let mut stats = self.stats.write();
+        let entry = stats
+            .rows
+            .entry(ns.to_string())
+            .or_default()
+            .entry(tbl.to_string())
+            .or_default();
+        if delta.is_negative() {
+            *entry = entry.saturating_sub(delta.unsigned_abs() as usize);
+        } else {
+            *entry += delta as usize;
+        }
     }
 
     fn enforce_row_schema(
@@ -394,6 +431,7 @@ impl PieskieoDb {
         let path = path.as_ref().to_path_buf();
         let wal = Wal::open(&path)?;
         let data = Arc::new(RwLock::new(Collections::default()));
+        let stats = Arc::new(RwLock::new(Stats::default()));
         let mut vecs = HashMap::new();
         vecs.insert(
             Self::default_ns(),
@@ -595,6 +633,7 @@ impl PieskieoDb {
             path,
             wal: RwLock::new(wal),
             data,
+            stats,
             vectors,
             vector_ns,
             graph,
@@ -636,7 +675,8 @@ impl PieskieoDb {
                 .entry(col_key.clone())
                 .or_default()
                 .insert(id, json.clone());
-            Self::index_upsert_doc(&mut guard, ns_key, col_key, id, &json);
+            Self::index_upsert_doc(&mut guard, ns_key.clone(), col_key.clone(), id, &json);
+            self.bump_doc_stats(&ns_key, &col_key, 1);
         }
         Ok(())
     }
@@ -668,7 +708,14 @@ impl PieskieoDb {
             if let Some(ns_map) = guard.docs.get_mut(&ns_key) {
                 if let Some(col_map) = ns_map.get_mut(&col_key) {
                     if let Some(old) = col_map.remove(id) {
-                        Self::index_remove_doc(&mut guard, ns_key, col_key, id, &old);
+                        Self::index_remove_doc(
+                            &mut guard,
+                            ns_key.clone(),
+                            col_key.clone(),
+                            id,
+                            &old,
+                        );
+                        self.bump_doc_stats(&ns_key, &col_key, -1);
                     }
                 }
             }
@@ -716,7 +763,8 @@ impl PieskieoDb {
                 .entry(tbl_key.clone())
                 .or_default()
                 .insert(id, json.clone());
-            Self::index_upsert_row(&mut guard, ns_key, tbl_key, id, &json);
+            Self::index_upsert_row(&mut guard, ns_key.clone(), tbl_key.clone(), id, &json);
+            self.bump_row_stats(&ns_key, &tbl_key, 1);
         }
         Ok(())
     }
@@ -793,7 +841,14 @@ impl PieskieoDb {
             if let Some(ns_map) = guard.rows.get_mut(&ns_key) {
                 if let Some(tbl_map) = ns_map.get_mut(&tbl_key) {
                     if let Some(old) = tbl_map.remove(id) {
-                        Self::index_remove_row(&mut guard, ns_key, tbl_key, id, &old);
+                        Self::index_remove_row(
+                            &mut guard,
+                            ns_key.clone(),
+                            tbl_key.clone(),
+                            id,
+                            &old,
+                        );
+                        self.bump_row_stats(&ns_key, &tbl_key, -1);
                     }
                 }
             }
@@ -2316,6 +2371,19 @@ impl PieskieoDb {
         if let (Some(ns), Some(coll)) = (ns, coll) {
             if let Some(ns_map) = index.get(ns) {
                 if let Some(col_map) = ns_map.get(coll) {
+                    let total_rows = self
+                        .stats
+                        .read()
+                        .docs
+                        .get(ns)
+                        .and_then(|m| m.get(coll))
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            map.get(ns)
+                                .and_then(|m| m.get(coll))
+                                .map(|m| m.len())
+                                .unwrap_or(0)
+                        });
                     let mut candidate: Option<Vec<Uuid>> = None;
                     for (field, val) in filter.iter() {
                         if let Some(key) = Self::index_key(val) {
@@ -2336,9 +2404,10 @@ impl PieskieoDb {
                     }
                     if let Some(ids) = candidate {
                         if let Some(inner) = map.get(ns).and_then(|m| m.get(coll)) {
-                            let total = inner.len();
-                            // simple cost: prefer index path only if estimated hits < half of total
-                            if ids.len() <= total / 2 {
+                            let estimated = ids.len();
+                            let threshold = (total_rows / 2).max(10);
+                            // use index only if estimated hit count is lower than threshold
+                            if estimated <= threshold {
                                 let mut out = Vec::new();
                                 let mut skipped = 0usize;
                                 for id in ids {
