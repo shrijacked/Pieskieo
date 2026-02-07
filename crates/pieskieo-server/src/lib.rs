@@ -42,10 +42,11 @@ use {
 
 #[derive(Clone)]
 struct AppState {
-    pool: Arc<DbPool>,
+    pool: Arc<RwLock<DbPool>>,
     auth: Arc<RwLock<AuthConfig>>,
     limiter: Arc<RateLimiter>,
     audit: Arc<AuditLog>,
+    data_dir: String,
 }
 
 #[derive(Clone)]
@@ -538,6 +539,11 @@ struct ReplicationBatch {
 }
 
 #[derive(Deserialize)]
+struct ReshardRequest {
+    shards: usize,
+}
+
+#[derive(Deserialize)]
 struct WalQuery {
     since: Option<u64>,
 }
@@ -582,6 +588,7 @@ struct VectorOutput {
 
 struct DbPool {
     shards: Vec<Arc<PieskieoDb>>,
+    template: PieskieoVectorParams,
 }
 
 impl DbPool {
@@ -599,7 +606,10 @@ impl DbPool {
             std::fs::create_dir_all(&dir)?;
             v.push(Arc::new(PieskieoDb::open_with_params(&dir, p)?));
         }
-        Ok(Self { shards: v })
+        Ok(Self {
+            shards: v,
+            template: params,
+        })
     }
 
     fn shard_for(&self, id: &Uuid) -> Arc<PieskieoDb> {
@@ -647,6 +657,20 @@ impl DbPool {
         }
         agg
     }
+
+    fn wal_all(&self) -> Vec<pieskieo_core::wal::RecordKind> {
+        let mut out = Vec::new();
+        for shard in &self.shards {
+            if let Ok(mut r) = shard.wal_dump() {
+                out.append(&mut r);
+            }
+        }
+        out
+    }
+
+    fn template_params(&self) -> PieskieoVectorParams {
+        self.template.clone()
+    }
 }
 
 pub async fn serve() -> anyhow::Result<()> {
@@ -658,7 +682,7 @@ pub async fn serve() -> anyhow::Result<()> {
     let auth = Arc::new(RwLock::new(AuthConfig::from_env(&data_dir)));
     let params = vector_params_from_env();
     let shards = params.shard_total.max(1);
-    let pool = Arc::new(DbPool::new(&data_dir, params, shards)?);
+    let pool = Arc::new(RwLock::new(DbPool::new(&data_dir, params, shards)?));
     let limiter = Arc::new(RateLimiter::from_env());
     let audit = Arc::new(AuditLog::new(
         PathBuf::from(&data_dir).join("logs").join("audit.log"),
@@ -669,6 +693,7 @@ pub async fn serve() -> anyhow::Result<()> {
         auth,
         limiter,
         audit,
+        data_dir,
     };
 
     // background WAL flusher (group commit) for better latency.
@@ -682,7 +707,8 @@ pub async fn serve() -> anyhow::Result<()> {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(flush_ms));
             loop {
                 interval.tick().await;
-                for shard in pool.each() {
+                let guard = pool.read().await;
+                for shard in guard.each() {
                     if let Err(e) = shard.flush_wal() {
                         tracing::warn!("wal flush failed: {e}");
                     }
@@ -698,7 +724,8 @@ pub async fn serve() -> anyhow::Result<()> {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(secs));
                 loop {
                     interval.tick().await;
-                    for shard in pool.each() {
+                    let guard = pool.read().await;
+                    for shard in guard.each() {
                         if let Err(e) = shard.save_vector_snapshot() {
                             tracing::warn!("snapshot save failed: {e}");
                         }
@@ -715,7 +742,8 @@ pub async fn serve() -> anyhow::Result<()> {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(secs));
                 loop {
                     interval.tick().await;
-                    for shard in pool.each() {
+                    let guard = pool.read().await;
+                    for shard in guard.each() {
                         if let Err(e) = shard.rebuild_vectors() {
                             tracing::warn!("vector rebuild failed: {e}");
                         }
@@ -752,6 +780,7 @@ pub async fn serve() -> anyhow::Result<()> {
         .route("/v1/replica/wal", get(replica_wal))
         .route("/v1/replica/apply", post(replica_apply))
         .route("/metrics", get(metrics))
+        .route("/v1/admin/reshard", post(reshard))
         .route("/v1/graph/edge", post(add_edge))
         .route("/v1/graph/:id", get(list_neighbors))
         .route("/v1/graph/:id/bfs", get(list_bfs))
@@ -872,6 +901,8 @@ async fn put_doc(
     let id = input.id.unwrap_or_else(Uuid::new_v4);
     state
         .pool
+        .read()
+        .await
         .shard_for(&id)
         .put_doc_ns(
             input.namespace.as_deref(),
@@ -890,6 +921,8 @@ async fn get_doc(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
     let doc = state
         .pool
+        .read()
+        .await
         .shard_for(&id)
         .get_doc_ns(ns.namespace.as_deref(), ns.collection.as_deref(), &id)
         .ok_or(ApiError::NotFound)?;
@@ -906,6 +939,8 @@ async fn delete_doc(
 ) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
     state
         .pool
+        .read()
+        .await
         .shard_for(&id)
         .delete_doc_ns(ns.namespace.as_deref(), ns.collection.as_deref(), &id)
         .map_err(ApiError::from)?;
@@ -922,6 +957,8 @@ async fn put_row(
     let id = input.id.unwrap_or_else(Uuid::new_v4);
     state
         .pool
+        .read()
+        .await
         .shard_for(&id)
         .put_row_ns(
             input.namespace.as_deref(),
@@ -939,7 +976,8 @@ async fn query_docs(
 ) -> Result<Json<ApiResponse<Vec<(Uuid, serde_json::Value)>>>, ApiError> {
     let mut hits = Vec::new();
     if let Some(sql) = input.sql {
-        for shard in state.pool.each() {
+        let guard = state.pool.read().await;
+        for shard in guard.each() {
             match shard.query_sql(&sql)? {
                 SqlResult::Select(mut rows) => {
                     hits.append(&mut rows);
@@ -951,7 +989,8 @@ async fn query_docs(
             hits.truncate(limit);
         }
     } else {
-        for shard in state.pool.each() {
+        let guard = state.pool.read().await;
+        for shard in guard.each() {
             hits.extend(shard.query_docs_ns(
                 input.namespace.as_deref(),
                 input.collection.as_deref(),
@@ -985,7 +1024,7 @@ async fn query_sql(
     let is_select = matches!(first, sqlparser::ast::Statement::Query(_));
     if is_select {
         let mut rows = Vec::new();
-        for shard in state.pool.each() {
+        for shard in state.pool.read().await.each() {
             match shard.query_sql(&input.sql)? {
                 SqlResult::Select(mut r) => rows.append(&mut r),
                 _ => {}
@@ -1004,7 +1043,8 @@ async fn query_sql(
     match first {
         sqlparser::ast::Statement::Update { .. } | sqlparser::ast::Statement::Delete { .. } => {
             let mut affected = 0usize;
-            for shard in state.pool.each() {
+            let guard = state.pool.read().await;
+            for shard in guard.each() {
                 match shard.query_sql(&input.sql)? {
                     SqlResult::Update { affected: a } | SqlResult::Delete { affected: a } => {
                         affected += a;
@@ -1019,7 +1059,7 @@ async fn query_sql(
         }
         sqlparser::ast::Statement::Insert { .. } => {
             // choose shard 0 for now
-            let shard = state.pool.shards[0].clone();
+            let shard = state.pool.read().await.shards[0].clone();
             match shard.query_sql(&input.sql)? {
                 SqlResult::Insert { ids } => Ok(Json(ApiResponse {
                     ok: true,
@@ -1047,12 +1087,14 @@ async fn set_schema(
     };
     match input.family.as_str() {
         "doc" | "docs" | "collection" | "collections" => {
-            for shard in state.pool.each() {
+            let guard = state.pool.read().await;
+            for shard in guard.each() {
                 shard.set_doc_schema(input.namespace.as_deref(), Some(&input.name), def.clone())?;
             }
         }
         "row" | "rows" | "table" | "tables" => {
-            for shard in state.pool.each() {
+            let guard = state.pool.read().await;
+            for shard in guard.each() {
                 shard.set_row_schema(input.namespace.as_deref(), Some(&input.name), def.clone())?;
             }
         }
@@ -1070,7 +1112,8 @@ async fn query_rows(
 ) -> Result<Json<ApiResponse<Vec<(Uuid, serde_json::Value)>>>, ApiError> {
     let mut hits = Vec::new();
     if let Some(sql) = input.sql {
-        for shard in state.pool.each() {
+        let guard = state.pool.read().await;
+        for shard in guard.each() {
             match shard.query_sql(&sql)? {
                 SqlResult::Select(mut rows) => {
                     hits.append(&mut rows);
@@ -1082,7 +1125,8 @@ async fn query_rows(
             hits.truncate(limit);
         }
     } else {
-        for shard in state.pool.each() {
+        let guard = state.pool.read().await;
+        for shard in guard.each() {
             hits.extend(shard.query_rows_ns(
                 input.namespace.as_deref(),
                 input.table.as_deref(),
@@ -1105,6 +1149,8 @@ async fn get_row(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
     let row = state
         .pool
+        .read()
+        .await
         .shard_for(&id)
         .get_row_ns(ns.namespace.as_deref(), ns.table.as_deref(), &id)
         .ok_or(ApiError::NotFound)?;
@@ -1121,6 +1167,8 @@ async fn delete_row(
 ) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
     state
         .pool
+        .read()
+        .await
         .shard_for(&id)
         .delete_row_ns(ns.namespace.as_deref(), ns.table.as_deref(), &id)
         .map_err(ApiError::from)?;
@@ -1136,6 +1184,8 @@ async fn put_vector(
 ) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
     state
         .pool
+        .read()
+        .await
         .shard_for(&input.id)
         .put_vector_with_meta_ns(
             input.namespace.as_deref(),
@@ -1155,10 +1205,9 @@ async fn put_vector_bulk(
     Json(input): Json<VectorBulk>,
 ) -> Result<Json<ApiResponse<usize>>, ApiError> {
     let mut stored = 0usize;
+    let pool = state.pool.read().await;
     for item in input.items {
-        state
-            .pool
-            .shard_for(&item.id)
+        pool.shard_for(&item.id)
             .put_vector_with_meta_ns(
                 item.namespace.as_deref(),
                 item.id,
@@ -1180,6 +1229,8 @@ async fn delete_vector(
 ) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
     state
         .pool
+        .read()
+        .await
         .shard_for(&id)
         .delete_vector(&id)
         .map_err(ApiError::from)?;
@@ -1193,8 +1244,8 @@ async fn get_vector(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ApiResponse<VectorOutput>>, ApiError> {
-    let (vector, meta) = state
-        .pool
+    let pool = state.pool.read().await;
+    let (vector, meta) = pool
         .shard_for(&id)
         .get_vector(&id)
         .ok_or(ApiError::NotFound)?;
@@ -1211,6 +1262,8 @@ async fn update_vector_meta(
 ) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
     state
         .pool
+        .read()
+        .await
         .shard_for(&id)
         .update_vector_meta(id, input.meta)
         .map_err(ApiError::from)?;
@@ -1227,6 +1280,8 @@ async fn delete_vector_meta_keys(
 ) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
     state
         .pool
+        .read()
+        .await
         .shard_for(&id)
         .remove_vector_meta_keys(id, &input.keys)
         .map_err(ApiError::from)?;
@@ -1249,14 +1304,15 @@ async fn search_vector(
     };
 
     if let Some(ef) = input.ef_search {
-        for shard in state.pool.each() {
+        let guard = state.pool.read().await;
+        for shard in guard.each() {
             shard.set_ef_search(ef);
         }
     }
 
     // For now metric selection is per-query; in future persist per-index config.
-    let futures = state
-        .pool
+    let pool = state.pool.read().await;
+    let futures = pool
         .each()
         .map(|shard| {
             let q = input.query.clone();
@@ -1293,18 +1349,19 @@ async fn update_vector_config(
     State(state): State<AppState>,
     Json(input): Json<VectorConfigInput>,
 ) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
+    let pool = state.pool.read().await;
     if let Some(ef) = input.ef_search {
-        for shard in state.pool.each() {
+        for shard in pool.each() {
             shard.set_ef_search(ef);
         }
     }
     if let Some(efc) = input.ef_construction {
-        for shard in state.pool.each() {
+        for shard in pool.each() {
             shard.set_ef_construction(efc);
         }
     }
     if let Some(k) = input.link_top_k {
-        for shard in state.pool.each() {
+        for shard in pool.each() {
             if let Some(db_mut) = Arc::get_mut(&mut shard.clone()) {
                 db_mut.set_link_top_k(k);
             } else {
@@ -1321,7 +1378,7 @@ async fn update_vector_config(
 async fn rebuild_vectors(
     State(state): State<AppState>,
 ) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
-    for shard in state.pool.each() {
+    for shard in state.pool.read().await.each() {
         shard.rebuild_vectors().map_err(ApiError::from)?;
     }
     Ok(Json(ApiResponse {
@@ -1333,7 +1390,7 @@ async fn rebuild_vectors(
 async fn vacuum_vectors(
     State(state): State<AppState>,
 ) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
-    for shard in state.pool.each() {
+    for shard in state.pool.read().await.each() {
         shard.vacuum().map_err(ApiError::from)?;
     }
     Ok(Json(ApiResponse {
@@ -1345,7 +1402,7 @@ async fn vacuum_vectors(
 async fn save_snapshot(
     State(state): State<AppState>,
 ) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
-    for shard in state.pool.each() {
+    for shard in state.pool.read().await.each() {
         shard.save_vector_snapshot().map_err(ApiError::from)?;
     }
     Ok(Json(ApiResponse {
@@ -1361,6 +1418,8 @@ async fn add_edge(
     let weight = input.weight.unwrap_or(1.0);
     state
         .pool
+        .read()
+        .await
         .shard_for(&input.src)
         .add_edge(input.src, input.dst, weight)
         .map_err(ApiError::from)?;
@@ -1374,7 +1433,7 @@ async fn list_neighbors(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ApiResponse<Vec<pieskieo_core::Edge>>>, ApiError> {
-    let edges = state.pool.shard_for(&id).neighbors(id, 100);
+    let edges = state.pool.read().await.shard_for(&id).neighbors(id, 100);
     Ok(Json(ApiResponse {
         ok: true,
         data: edges,
@@ -1385,7 +1444,7 @@ async fn list_bfs(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ApiResponse<Vec<pieskieo_core::Edge>>>, ApiError> {
-    let edges = state.pool.shard_for(&id).bfs(id, 100);
+    let edges = state.pool.read().await.shard_for(&id).bfs(id, 100);
     Ok(Json(ApiResponse {
         ok: true,
         data: edges,
@@ -1396,7 +1455,7 @@ async fn list_dfs(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ApiResponse<Vec<pieskieo_core::Edge>>>, ApiError> {
-    let edges = state.pool.shard_for(&id).dfs(id, 100);
+    let edges = state.pool.read().await.shard_for(&id).dfs(id, 100);
     Ok(Json(ApiResponse {
         ok: true,
         data: edges,
@@ -1407,7 +1466,8 @@ async fn which_shard(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ApiResponse<HashMap<&'static str, usize>>>, ApiError> {
-    let shard_total = state.pool.shards.len();
+    let pool = state.pool.read().await;
+    let shard_total = pool.shards.len();
     let mut arr = [0u8; 8];
     arr.copy_from_slice(&id.as_bytes()[..8]);
     let shard_id = (u64::from_le_bytes(arr) as usize) % shard_total;
@@ -1423,7 +1483,8 @@ async fn which_shard(
 async fn metrics(
     State(state): State<AppState>,
 ) -> Result<impl axum::response::IntoResponse, ApiError> {
-    let m = state.pool.aggregate_metrics();
+    let guard = state.pool.read().await;
+    let m = guard.aggregate_metrics();
     let mut body = format!(
         "pieskieo_docs {}\npieskieo_rows {}\npieskieo_vectors {}\npieskieo_vector_tombstones {}\npieskieo_hnsw_ready {}\npieskieo_ef_search {}\npieskieo_ef_construction {}\npieskieo_link_top_k {}\npieskieo_shard_total {}\n",
         m.docs,
@@ -1438,7 +1499,7 @@ async fn metrics(
     );
     let rejects = state.limiter.rejected.load(Ordering::Relaxed);
     body.push_str(&format!("pieskieo_rate_rejects {}\n", rejects));
-    for (idx, shard) in state.pool.shards.iter().enumerate() {
+    for (idx, shard) in guard.shards.iter().enumerate() {
         let s = shard.metrics();
         body.push_str(&format!(
             "pieskieo_shard_vectors{{shard=\"{}\"}} {}\npieskieo_shard_docs{{shard=\"{}\"}} {}\npieskieo_shard_rows{{shard=\"{}\"}} {}\n",
@@ -1465,7 +1526,8 @@ async fn replica_wal(
     }
     let since = q.since.unwrap_or(0);
     let mut slices = Vec::new();
-    for (idx, shard) in state.pool.shards.iter().enumerate() {
+    let guard = state.pool.read().await;
+    for (idx, shard) in guard.shards.iter().enumerate() {
         let (records, end) = shard.wal_replay_since(since).map_err(ApiError::from)?;
         let mut encoded: Vec<String> = Vec::with_capacity(records.len());
         for rec in records {
@@ -1502,12 +1564,46 @@ async fn replica_apply(
             .map_err(|e| ApiError::BadRequest(format!("decode: {e}")))?;
         records.push(rec);
     }
-    for shard in state.pool.each() {
+    let guard = state.pool.read().await;
+    for shard in guard.each() {
         shard.apply_records(&records).map_err(ApiError::from)?;
     }
     Ok(Json(ApiResponse {
         ok: true,
         data: "applied",
+    }))
+}
+
+async fn reshard(
+    State(state): State<AppState>,
+    Extension(role): Extension<Role>,
+    Json(input): Json<ReshardRequest>,
+) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
+    if !matches!(role, Role::Admin) {
+        return Err(ApiError::Forbidden);
+    }
+    let new_shards = input.shards.max(1);
+    let (wal, template) = {
+        let guard = state.pool.read().await;
+        (guard.wal_all(), guard.template_params())
+    };
+    let mut params = template.clone();
+    params.shard_total = new_shards;
+    let new_pool = DbPool::new(&state.data_dir, params, new_shards).map_err(ApiError::Internal)?;
+    for rec in &wal {
+        for shard in new_pool.each() {
+            shard
+                .apply_records(&[rec.clone()])
+                .map_err(ApiError::from)?;
+        }
+    }
+    {
+        let mut guard = state.pool.write().await;
+        *guard = new_pool;
+    }
+    Ok(Json(ApiResponse {
+        ok: true,
+        data: "resharded",
     }))
 }
 
