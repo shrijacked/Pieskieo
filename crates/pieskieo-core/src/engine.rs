@@ -2336,27 +2336,31 @@ impl PieskieoDb {
                     }
                     if let Some(ids) = candidate {
                         if let Some(inner) = map.get(ns).and_then(|m| m.get(coll)) {
-                            let mut out = Vec::new();
-                            let mut skipped = 0usize;
-                            for id in ids {
-                                if !self.owns(&id) {
-                                    continue;
-                                }
-                                if let Some(v) = inner.get(&id) {
-                                    if !value_matches(v, filter) {
+                            let total = inner.len();
+                            // simple cost: prefer index path only if estimated hits < half of total
+                            if ids.len() <= total / 2 {
+                                let mut out = Vec::new();
+                                let mut skipped = 0usize;
+                                for id in ids {
+                                    if !self.owns(&id) {
                                         continue;
                                     }
-                                    if skipped < offset {
-                                        skipped += 1;
-                                        continue;
-                                    }
-                                    out.push((id, v.clone()));
-                                    if out.len() >= limit {
-                                        return out;
+                                    if let Some(v) = inner.get(&id) {
+                                        if !value_matches(v, filter) {
+                                            continue;
+                                        }
+                                        if skipped < offset {
+                                            skipped += 1;
+                                            continue;
+                                        }
+                                        out.push((id, v.clone()));
+                                        if out.len() >= limit {
+                                            return out;
+                                        }
                                     }
                                 }
+                                return out;
                             }
-                            return out;
                         }
                     }
                 }

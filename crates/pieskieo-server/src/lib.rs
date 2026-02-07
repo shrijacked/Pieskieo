@@ -559,6 +559,12 @@ struct WalShardSlice {
 struct WalExport {
     slices: Vec<WalShardSlice>,
 }
+
+#[derive(Serialize)]
+struct WalStream {
+    end_offset: u64,
+    slices: Vec<WalShardSlice>,
+}
 #[derive(Deserialize)]
 struct EdgeInput {
     src: Uuid,
@@ -778,6 +784,7 @@ pub async fn serve() -> anyhow::Result<()> {
         .route("/v1/schema", post(set_schema))
         .route("/v1/sql", post(query_sql))
         .route("/v1/replica/wal", get(replica_wal))
+        .route("/v1/replica/stream", get(replica_stream))
         .route("/v1/replica/apply", post(replica_apply))
         .route("/metrics", get(metrics))
         .route("/v1/admin/reshard", post(reshard))
@@ -1572,6 +1579,57 @@ async fn replica_apply(
         ok: true,
         data: "applied",
     }))
+}
+
+// Long-polling incremental stream; returns immediately if new data exists, otherwise waits up to 10s.
+async fn replica_stream(
+    State(state): State<AppState>,
+    Extension(role): Extension<Role>,
+    Query(q): Query<WalQuery>,
+) -> Result<Json<ApiResponse<WalStream>>, ApiError> {
+    if !matches!(role, Role::Admin) {
+        return Err(ApiError::Forbidden);
+    }
+    let since = q.since.unwrap_or(0);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut last_offset = since;
+    loop {
+        let guard = state.pool.read().await;
+        let mut slices = Vec::new();
+        let mut max_end = since;
+        for (idx, shard) in guard.shards.iter().enumerate() {
+            let (records, end) = shard
+                .wal_replay_since(last_offset)
+                .map_err(ApiError::from)?;
+            if !records.is_empty() {
+                let mut encoded: Vec<String> = Vec::with_capacity(records.len());
+                for rec in records {
+                    let bytes = bincode::serialize(&rec)
+                        .map_err(|e| ApiError::Internal(anyhow::anyhow!(e)))?;
+                    encoded.push(B64.encode(bytes));
+                }
+                slices.push(WalShardSlice {
+                    shard: idx,
+                    end_offset: end,
+                    records: encoded,
+                });
+            }
+            if end > max_end {
+                max_end = end;
+            }
+        }
+        if !slices.is_empty() || max_end > since || std::time::Instant::now() >= deadline {
+            return Ok(Json(ApiResponse {
+                ok: true,
+                data: WalStream {
+                    end_offset: max_end,
+                    slices,
+                },
+            }));
+        }
+        last_offset = max_end;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
 }
 
 async fn reshard(
