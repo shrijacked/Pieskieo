@@ -25,7 +25,7 @@ Unified multi‑model engine: relational (Postgres‑ish), document (Mongo‑ish
 ## Near-term TODO (next moves)
 1) Harden surface: TLS by default in prod, per‑IP/backoff rate limits (done), audit logs with rotation (done).  
 2) Planner v2: cost model + index selection, vector+filter fusion (next).  
-3) Distributed story: reshard without downtime, async replication + follower reads (WAL export/apply + incremental offset added; still needs orchestrated reshard and live streaming loop).  
+3) Distributed story: reshard without downtime, async replication + follower reads (incremental WAL + admin reshard endpoint + CLI follower pull loop added; future: streaming/push + pause/verify workflows).  
 4) Benchmarks: publish latency/recall for 768 & 3072 dims; crash/chaos matrix.  
 5) Release: cargo-dist artifacts, checksums, signed releases, docs site.  
 
