@@ -5,9 +5,7 @@ use crate::{error::PieskieoError, graph::GraphStore};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlparser::ast::{
-    BinaryOperator, Expr, OrderByExpr, SelectItem, SetExpr, Statement, TableFactor,
-};
+use sqlparser::ast::{BinaryOperator, Expr, OrderByExpr, SelectItem, SetExpr, Statement, TableFactor};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::collections::{BTreeMap, HashMap};
@@ -23,6 +21,9 @@ pub(crate) struct Collections {
     // simple equality secondary index: ns -> collection -> field -> value_json -> ids
     row_index: HashMap<String, HashMap<String, HashMap<String, HashMap<String, Vec<Uuid>>>>>,
     doc_index: HashMap<String, HashMap<String, HashMap<String, HashMap<String, Vec<Uuid>>>>>,
+    // schemas
+    row_schema: HashMap<String, HashMap<String, SchemaDef>>,
+    doc_schema: HashMap<String, HashMap<String, SchemaDef>>,
 }
 
 pub struct PieskieoDb {
@@ -38,6 +39,29 @@ pub struct PieskieoDb {
     shard_id: usize,
     shard_total: usize,
     default_params: VectorParams,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SchemaField {
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub unique: bool,
+    #[serde(default)]
+    pub r#type: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SchemaDef {
+    pub fields: HashMap<String, SchemaField>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub enum SqlResult {
+    Select(Vec<(Uuid, Value)>),
+    Insert { ids: Vec<Uuid> },
+    Update { affected: usize },
+    Delete { affected: usize },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +89,273 @@ impl PieskieoDb {
 
     fn default_ns() -> String {
         "default".to_string()
+    }
+
+    fn enforce_doc_schema(
+        &self,
+        ns: Option<&str>,
+        collection: Option<&str>,
+        id: &Uuid,
+        json: &Value,
+    ) -> Result<()> {
+        let ns_key = Self::ns(ns);
+        let col_key = Self::col(collection);
+        let guard = self.data.read();
+        if let Some(schema) = guard
+            .doc_schema
+            .get(&ns_key)
+            .and_then(|m| m.get(&col_key))
+        {
+            Self::validate_object(json)?;
+            Self::check_schema(id, json, schema, guard.doc_index.get(&ns_key).and_then(|m| m.get(&col_key)))?;
+        }
+        Ok(())
+    }
+
+    fn enforce_row_schema(
+        &self,
+        ns: Option<&str>,
+        table: Option<&str>,
+        id: &Uuid,
+        json: &Value,
+    ) -> Result<()> {
+        let ns_key = Self::ns(ns);
+        let tbl_key = Self::col(table);
+        let guard = self.data.read();
+        if let Some(schema) = guard
+            .row_schema
+            .get(&ns_key)
+            .and_then(|m| m.get(&tbl_key))
+        {
+            Self::validate_object(json)?;
+            Self::check_schema(id, json, schema, guard.row_index.get(&ns_key).and_then(|m| m.get(&tbl_key)))?;
+        }
+        Ok(())
+    }
+
+    fn validate_object(json: &Value) -> Result<()> {
+        if !json.is_object() {
+            return Err(PieskieoError::Validation("value must be object".into()));
+        }
+        Ok(())
+    }
+
+    fn check_schema(
+        id: &Uuid,
+        json: &Value,
+        schema: &SchemaDef,
+        index: Option<&HashMap<String, HashMap<String, Vec<Uuid>>>>,
+    ) -> Result<()> {
+        let obj = json
+            .as_object()
+            .ok_or_else(|| PieskieoError::Validation("value must be object".into()))?;
+        for (field, spec) in &schema.fields {
+            if spec.required && !obj.contains_key(field) {
+                return Err(PieskieoError::Validation(format!(
+                    "field '{field}' is required"
+                )));
+            }
+            if spec.unique {
+                if let Some(val) = obj.get(field) {
+                    if let Some(key) = Self::index_key(val) {
+                        if let Some(idx_field) = index.and_then(|m| m.get(field)) {
+                            if let Some(ids) = idx_field.get(&key) {
+                                if ids.iter().any(|existing| existing != id) {
+                                    return Err(PieskieoError::UniqueViolation(field.clone()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn exec_insert(&self, stmt: &Statement) -> Result<SqlResult> {
+        let insert = match stmt {
+            Statement::Insert { table_name, columns, source, .. } => (table_name, columns, source),
+            _ => return Err(PieskieoError::Internal("not insert".into())),
+        };
+        let (family, ns, coll) = self.split_name(insert.0)?;
+        let target_rows = Self::target_is_rows(family.as_deref(), &coll);
+        let columns: Vec<String> = insert.1.iter().map(|c| c.value.clone()).collect();
+        if columns.is_empty() {
+            return Err(PieskieoError::Internal(
+                "column list required for INSERT".into(),
+            ));
+        }
+        let query = insert
+            .2
+            .as_ref()
+            .ok_or_else(|| PieskieoError::Internal("INSERT source required".into()))?;
+        let values = match query.body.as_ref() {
+            SetExpr::Values(v) => {
+                if v.rows.len() != 1 {
+                    return Err(PieskieoError::Internal(
+                        "only single VALUES row supported".into(),
+                    ));
+                }
+                v.rows[0].clone()
+            }
+            _ => {
+                return Err(PieskieoError::Internal(
+                    "only VALUES insert supported".into(),
+                ))
+            }
+        };
+        if columns.len() != values.len() {
+            return Err(PieskieoError::Internal(
+                "column count does not match values".into(),
+            ));
+        }
+        let mut obj = serde_json::Map::new();
+        for (idx, expr) in values.iter().enumerate() {
+            let key = if columns.is_empty() {
+                format!("col{idx}")
+            } else {
+                columns[idx].clone()
+            };
+            let val = Self::literal_to_value(expr)
+                .ok_or_else(|| PieskieoError::Internal("unsupported literal in insert".into()))?;
+            obj.insert(key, val);
+        }
+        // determine id
+        let mut id = None;
+        for k in &["id", "_id"] {
+            if let Some(v) = obj.get(*k) {
+                if let Some(s) = v.as_str() {
+                    if let Ok(uuid) = Uuid::parse_str(s) {
+                        id = Some(uuid);
+                    }
+                }
+            }
+        }
+        let uid = id.unwrap_or_else(Uuid::new_v4);
+        if target_rows {
+            self.put_row_ns(Some(&ns), Some(&coll), uid, &Value::Object(obj))?;
+        } else {
+            self.put_doc_ns(Some(&ns), Some(&coll), uid, Value::Object(obj))?;
+        }
+        Ok(SqlResult::Insert { ids: vec![uid] })
+    }
+
+    fn exec_update(&self, stmt: &Statement) -> Result<SqlResult> {
+        let (table, assignments, selection) = match stmt {
+            Statement::Update {
+                table,
+                assignments,
+                selection,
+                ..
+            } => (table, assignments, selection),
+            _ => return Err(PieskieoError::Internal("not update".into())),
+        };
+        let name = self.extract_name_from_table_factor(&table.relation)?;
+        let (family, ns, coll) = self.split_name(name)?;
+        let target_rows = Self::target_is_rows(family.as_deref(), &coll);
+        let conds = if let Some(expr) = selection {
+            let mut c = Vec::new();
+            self.walk_expr(expr, &mut c)?;
+            c
+        } else {
+            Vec::new()
+        };
+        // collect matches
+        let matches: Vec<(Uuid, Value)> = {
+            let guard = self.data.read();
+            if target_rows {
+                guard
+                    .rows
+                    .get(&ns)
+                    .and_then(|m| m.get(&coll))
+                    .map(|map| self.filter_conditions(map, &conds, usize::MAX, 0))
+                    .unwrap_or_default()
+            } else {
+                guard
+                    .docs
+                    .get(&ns)
+                    .and_then(|m| m.get(&coll))
+                    .map(|map| self.filter_conditions(map, &conds, usize::MAX, 0))
+                    .unwrap_or_default()
+            }
+        };
+        let mut affected = 0usize;
+        for (id, mut val) in matches {
+            if let Some(obj) = val.as_object_mut() {
+                for assign in assignments {
+                    let key = assign
+                        .id
+                        .first()
+                        .ok_or_else(|| PieskieoError::Internal("assignment missing column".into()))?
+                        .value
+                        .clone();
+                    let rhs = Self::literal_to_value(&assign.value).ok_or_else(|| {
+                        PieskieoError::Internal("assignment literal not supported".into())
+                    })?;
+                    obj.insert(key, rhs);
+                }
+            }
+            if target_rows {
+                self.put_row_ns(Some(&ns), Some(&coll), id, &val)?;
+            } else {
+                self.put_doc_ns(Some(&ns), Some(&coll), id, val)?;
+            }
+            affected += 1;
+        }
+        Ok(SqlResult::Update { affected })
+    }
+
+    fn exec_delete(&self, stmt: &Statement) -> Result<SqlResult> {
+        let (tables, selection) = match stmt {
+            Statement::Delete { tables, selection, .. } => (tables, selection),
+            _ => return Err(PieskieoError::Internal("not delete".into())),
+        };
+        let table = tables
+            .first()
+            .ok_or_else(|| PieskieoError::Internal("table required".into()))?;
+        let (family, ns, coll) = self.split_name(table)?;
+        let target_rows = Self::target_is_rows(family.as_deref(), &coll);
+        let conds = if let Some(expr) = selection {
+            let mut c = Vec::new();
+            self.walk_expr(expr, &mut c)?;
+            c
+        } else {
+            Vec::new()
+        };
+        let matches: Vec<Uuid> = {
+            let guard = self.data.read();
+            if target_rows {
+                guard
+                    .rows
+                    .get(&ns)
+                    .and_then(|m| m.get(&coll))
+                    .map(|map| self.filter_conditions(map, &conds, usize::MAX, 0))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect()
+            } else {
+                guard
+                    .docs
+                    .get(&ns)
+                    .and_then(|m| m.get(&coll))
+                    .map(|map| self.filter_conditions(map, &conds, usize::MAX, 0))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect()
+            }
+        };
+        for id in &matches {
+            if target_rows {
+                self.delete_row_ns(Some(&ns), Some(&coll), id)?;
+            } else {
+                self.delete_doc_ns(Some(&ns), Some(&coll), id)?;
+            }
+        }
+        Ok(SqlResult::Delete {
+            affected: matches.len(),
+        })
     }
 
     /// Fetch existing index for namespace or create one with default params.
@@ -212,6 +503,37 @@ impl PieskieoDb {
                     }
                     DataFamily::Graph => {}
                 },
+                RecordKind::Schema {
+                    family,
+                    namespace,
+                    collection,
+                    table,
+                    schema,
+                } => {
+                    let def: SchemaDef = serde_json::from_slice(&schema)?;
+                    let mut guard = data.write();
+                    match family {
+                        DataFamily::Doc => {
+                            let ns = namespace.unwrap_or_else(Self::default_ns);
+                            let col = collection.unwrap_or_else(Self::default_ns);
+                            guard
+                                .doc_schema
+                                .entry(ns)
+                                .or_default()
+                                .insert(col, def);
+                        }
+                        DataFamily::Row => {
+                            let ns = namespace.unwrap_or_else(Self::default_ns);
+                            let tbl = table.unwrap_or_else(Self::default_ns);
+                            guard
+                                .row_schema
+                                .entry(ns)
+                                .or_default()
+                                .insert(tbl, def);
+                        }
+                        _ => {}
+                    }
+                }
                 RecordKind::AddEdge { src, dst, weight } => {
                     graph.add_edge(src, dst, weight);
                 }
@@ -289,6 +611,7 @@ impl PieskieoDb {
         if !self.owns(&id) {
             return Err(PieskieoError::WrongShard);
         }
+        self.enforce_doc_schema(ns, collection, &id, &json)?;
         let payload = serde_json::to_vec(&json)?;
         self.append_record(&RecordKind::Put {
             family: DataFamily::Doc,
@@ -368,6 +691,7 @@ impl PieskieoDb {
             return Err(PieskieoError::WrongShard);
         }
         let json = serde_json::to_value(row)?;
+        self.enforce_row_schema(ns, table, &id, &json)?;
         let payload = serde_json::to_vec(&json)?;
         self.append_record(&RecordKind::Put {
             family: DataFamily::Row,
@@ -390,6 +714,56 @@ impl PieskieoDb {
                 .insert(id, json.clone());
             Self::index_upsert_row(&mut guard, ns_key, tbl_key, id, &json);
         }
+        Ok(())
+    }
+
+    pub fn set_doc_schema(
+        &self,
+        ns: Option<&str>,
+        collection: Option<&str>,
+        schema: SchemaDef,
+    ) -> Result<()> {
+        let ns_key = Self::ns(ns);
+        let col_key = Self::col(collection);
+        let payload = serde_json::to_vec(&schema)?;
+        self.append_record(&RecordKind::Schema {
+            family: DataFamily::Doc,
+            namespace: Some(ns_key.clone()),
+            collection: Some(col_key.clone()),
+            table: None,
+            schema: payload,
+        })?;
+        let mut guard = self.data.write();
+        guard
+            .doc_schema
+            .entry(ns_key)
+            .or_default()
+            .insert(col_key, schema);
+        Ok(())
+    }
+
+    pub fn set_row_schema(
+        &self,
+        ns: Option<&str>,
+        table: Option<&str>,
+        schema: SchemaDef,
+    ) -> Result<()> {
+        let ns_key = Self::ns(ns);
+        let tbl_key = Self::col(table);
+        let payload = serde_json::to_vec(&schema)?;
+        self.append_record(&RecordKind::Schema {
+            family: DataFamily::Row,
+            namespace: Some(ns_key.clone()),
+            collection: None,
+            table: Some(tbl_key.clone()),
+            schema: payload,
+        })?;
+        let mut guard = self.data.write();
+        guard
+            .row_schema
+            .entry(ns_key)
+            .or_default()
+            .insert(tbl_key, schema);
         Ok(())
     }
 
@@ -526,10 +900,8 @@ impl PieskieoDb {
         )
     }
 
-    /// SQL-ish query over docs or rows. Supported:
-    /// SELECT * FROM namespace.collection WHERE a = 1 AND b > 2 LIMIT 100 OFFSET 10;
-    /// namespace or collection may be omitted (defaults to "default").
-    pub fn query_sql(&self, sql: &str) -> Result<Vec<(Uuid, Value)>> {
+    /// SQL-ish over docs/rows. Supports SELECT/INSERT/UPDATE/DELETE (single statement).
+    pub fn query_sql(&self, sql: &str) -> Result<SqlResult> {
         let dialect = GenericDialect {};
         let ast = Parser::parse_sql(&dialect, sql)
             .map_err(|e| PieskieoError::Internal(format!("sql parse error: {e}").into()))?;
@@ -537,66 +909,12 @@ impl PieskieoDb {
             return Err(PieskieoError::Internal("one statement expected".into()));
         }
         let stmt = &ast[0];
-        let (ns, coll, conds, projections, limit, offset, order_by, target_rows) =
-            self.parse_select(stmt)?;
-        let mut rows = {
-            let guard = self.data.read();
-            if target_rows {
-                guard
-                    .rows
-                    .get(&ns)
-                    .and_then(|m| m.get(&coll))
-                    .map(|map| self.filter_conditions(map, &conds, usize::MAX, 0))
-                    .unwrap_or_default()
-            } else {
-                guard
-                    .docs
-                    .get(&ns)
-                    .and_then(|m| m.get(&coll))
-                    .map(|map| self.filter_conditions(map, &conds, usize::MAX, 0))
-                    .unwrap_or_default()
-            }
-        };
-
-        if !order_by.is_empty() {
-            rows.sort_by(|a, b| {
-                for (field, asc) in order_by.iter() {
-                    let av = a.1.get(field);
-                    let bv = b.1.get(field);
-                    let ord = match (av, bv) {
-                        (Some(x), Some(y)) => cmp_values(x, y).unwrap_or(std::cmp::Ordering::Equal),
-                        (Some(_), None) => std::cmp::Ordering::Greater,
-                        (None, Some(_)) => std::cmp::Ordering::Less,
-                        _ => std::cmp::Ordering::Equal,
-                    };
-                    if ord != std::cmp::Ordering::Equal {
-                        return if *asc { ord } else { ord.reverse() };
-                    }
-                }
-                std::cmp::Ordering::Equal
-            });
-        }
-
-        let start = offset.min(rows.len());
-        let end = (start + limit).min(rows.len());
-        let slice = &rows[start..end];
-
-        if let Some(projs) = projections {
-            let mut projected = Vec::with_capacity(slice.len());
-            for (id, v) in slice {
-                let mut obj = serde_json::Map::new();
-                for p in projs.iter() {
-                    if p.source == "_id" {
-                        obj.insert(p.alias.clone(), Value::String(id.to_string()));
-                    } else if let Some(val) = v.get(&p.source) {
-                        obj.insert(p.alias.clone(), val.clone());
-                    }
-                }
-                projected.push((*id, Value::Object(obj)));
-            }
-            Ok(projected)
-        } else {
-            Ok(slice.to_vec())
+        match stmt {
+            Statement::Query(_) => self.exec_select(stmt),
+            Statement::Insert { .. } => self.exec_insert(stmt),
+            Statement::Update { .. } => self.exec_update(stmt),
+            Statement::Delete { .. } => self.exec_delete(stmt),
+            _ => Err(PieskieoError::Internal("statement not supported".into())),
         }
     }
 
@@ -1179,6 +1497,71 @@ impl PieskieoDb {
         out
     }
 
+    fn exec_select(&self, stmt: &Statement) -> Result<SqlResult> {
+        let (ns, coll, conds, projections, limit, offset, order_by, target_rows) =
+            self.parse_select(stmt)?;
+        let mut rows = {
+            let guard = self.data.read();
+            if target_rows {
+                guard
+                    .rows
+                    .get(&ns)
+                    .and_then(|m| m.get(&coll))
+                    .map(|map| self.filter_conditions(map, &conds, usize::MAX, 0))
+                    .unwrap_or_default()
+            } else {
+                guard
+                    .docs
+                    .get(&ns)
+                    .and_then(|m| m.get(&coll))
+                    .map(|map| self.filter_conditions(map, &conds, usize::MAX, 0))
+                    .unwrap_or_default()
+            }
+        };
+
+        if !order_by.is_empty() {
+            rows.sort_by(|a, b| {
+                for (field, asc) in order_by.iter() {
+                    let av = a.1.get(field);
+                    let bv = b.1.get(field);
+                    let ord = match (av, bv) {
+                        (Some(x), Some(y)) => cmp_values(x, y).unwrap_or(std::cmp::Ordering::Equal),
+                        (Some(_), None) => std::cmp::Ordering::Greater,
+                        (None, Some(_)) => std::cmp::Ordering::Less,
+                        _ => std::cmp::Ordering::Equal,
+                    };
+                    if ord != std::cmp::Ordering::Equal {
+                        return if *asc { ord } else { ord.reverse() };
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+        }
+
+        let start = offset.min(rows.len());
+        let end = (start + limit).min(rows.len());
+        let slice = &rows[start..end];
+
+        let out = if let Some(projs) = projections {
+            let mut projected = Vec::with_capacity(slice.len());
+            for (id, v) in slice {
+                let mut obj = serde_json::Map::new();
+                for p in projs.iter() {
+                    if p.source == "_id" {
+                        obj.insert(p.alias.clone(), Value::String(id.to_string()));
+                    } else if let Some(val) = v.get(&p.source) {
+                        obj.insert(p.alias.clone(), val.clone());
+                    }
+                }
+                projected.push((*id, Value::Object(obj)));
+            }
+            projected
+        } else {
+            slice.to_vec()
+        };
+        Ok(SqlResult::Select(out))
+    }
+
     fn parse_select(
         &self,
         stmt: &Statement,
@@ -1303,6 +1686,43 @@ impl PieskieoDb {
         };
         let asc = ob.asc.unwrap_or(true);
         Ok((field, asc))
+    }
+
+    fn split_name(
+        &self,
+        name: &sqlparser::ast::ObjectName,
+    ) -> Result<(Option<String>, String, String)> {
+        let parts: Vec<String> = name.0.iter().map(|i| i.value.clone()).collect();
+        match parts.len() {
+            3 => Ok((Some(parts[0].clone()), parts[1].clone(), parts[2].clone())),
+            2 => Ok((None, parts[0].clone(), parts[1].clone())),
+            1 => Ok((None, "default".into(), parts[0].clone())),
+            _ => Err(PieskieoError::Internal(
+            "table name must be [family.]ns.coll".into(),
+        )),
+        }
+    }
+
+    fn extract_name_from_table_factor<'a>(
+        &self,
+        tf: &'a TableFactor,
+    ) -> Result<&'a sqlparser::ast::ObjectName> {
+        match tf {
+            TableFactor::Table { name, .. } => Ok(name),
+            _ => Err(PieskieoError::Internal(
+                "only base tables supported".into(),
+            )),
+        }
+    }
+
+    fn target_is_rows(family: Option<&str>, coll: &str) -> bool {
+        match family {
+            Some("rows") | Some("tables") | Some("table") | Some("row") => true,
+            Some("docs") | Some("collections") | Some("doc") => false,
+            _ => {
+                coll.starts_with("rows_") || coll.starts_with("table_") || coll.starts_with("tbl_")
+            }
+        }
     }
 
     fn walk_expr(&self, expr: &Expr, out: &mut Vec<Condition>) -> Result<()> {
@@ -1800,8 +2220,12 @@ mod tests {
         let res = db.query_sql(
             "SELECT name, age FROM docs.default.people WHERE age > 0 ORDER BY age ASC LIMIT 1",
         )?;
-        assert_eq!(res.len(), 1);
-        let (_id, val) = &res[0];
+        let rows = match res {
+            SqlResult::Select(r) => r,
+            _ => panic!("expected select"),
+        };
+        assert_eq!(rows.len(), 1);
+        let (_id, val) = &rows[0];
         let obj = val.as_object().unwrap();
         assert_eq!(obj.get("name").unwrap(), "bob");
         assert!(!obj.contains_key("city"));
@@ -1837,9 +2261,13 @@ mod tests {
             "SELECT first AS fname, _id AS id FROM default.people \
              WHERE score >= 5 ORDER BY score DESC, age ASC LIMIT 2",
         )?;
-        assert_eq!(res.len(), 2);
-        let (_, v0) = &res[0];
-        let (_, v1) = &res[1];
+        let rows = match res {
+            SqlResult::Select(r) => r,
+            _ => panic!("expected select"),
+        };
+        assert_eq!(rows.len(), 2);
+        let (_, v0) = &rows[0];
+        let (_, v1) = &rows[1];
         let f0 = v0.get("fname").unwrap().as_str().unwrap();
         let f1 = v1.get("fname").unwrap().as_str().unwrap();
         // same score, so age secondary; bob(25) then alice(30)
@@ -1864,8 +2292,12 @@ mod tests {
         )?;
 
         let res = db.query_sql("SELECT * FROM rows.analytics.table_sessions WHERE score >= 5")?;
-        assert_eq!(res.len(), 1);
-        assert_eq!(res[0].1["score"], 5);
+        let rows = match res {
+            SqlResult::Select(r) => r,
+            _ => panic!("expected select"),
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1["score"], 5);
         Ok(())
     }
 }

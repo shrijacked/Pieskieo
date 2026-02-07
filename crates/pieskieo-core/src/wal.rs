@@ -33,6 +33,16 @@ pub enum RecordKind {
         dst: Uuid,
         weight: f32,
     },
+    Schema {
+        family: DataFamily,
+        #[serde(default)]
+        namespace: Option<String>,
+        #[serde(default)]
+        collection: Option<String>,
+        #[serde(default)]
+        table: Option<String>,
+        schema: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

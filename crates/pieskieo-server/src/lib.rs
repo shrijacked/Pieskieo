@@ -7,8 +7,11 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
+use sqlparser::{dialect::GenericDialect, parser::Parser};
 use futures::future::join_all;
-use pieskieo_core::{PieskieoDb, PieskieoError, VectorParams as PieskieoVectorParams};
+use pieskieo_core::{
+    PieskieoDb, PieskieoError, SchemaDef, SchemaField, SqlResult, VectorParams as PieskieoVectorParams,
+};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
@@ -42,6 +45,14 @@ struct QueryInput {
 struct SqlInput {
     sql: String,
     limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct SchemaInput {
+    family: String, // "doc" or "row"
+    namespace: Option<String>,
+    name: String,
+    fields: HashMap<String, SchemaField>,
 }
 
 #[derive(Deserialize)]
@@ -277,6 +288,7 @@ pub async fn serve() -> anyhow::Result<()> {
         .route("/v1/vector/snapshot/save", post(save_snapshot))
         .route("/v1/vector/bulk", post(put_vector_bulk))
         .route("/v1/vector/:id", delete(delete_vector))
+        .route("/v1/schema", post(set_schema))
         .route("/v1/sql", post(query_sql))
         .route("/metrics", get(metrics))
         .route("/v1/graph/edge", post(add_edge))
@@ -419,8 +431,11 @@ async fn query_docs(
     let mut hits = Vec::new();
     if let Some(sql) = input.sql {
         for shard in state.pool.each() {
-            if let Ok(mut rows) = shard.query_sql(&sql) {
-                hits.append(&mut rows);
+            match shard.query_sql(&sql)? {
+                SqlResult::Select(mut rows) => {
+                    hits.append(&mut rows);
+                }
+                _ => return Err(ApiError::BadRequest("SQL must be SELECT".into())),
             }
         }
         if let Some(limit) = input.limit {
@@ -446,17 +461,90 @@ async fn query_docs(
 async fn query_sql(
     State(state): State<AppState>,
     Json(input): Json<SqlInput>,
-) -> Result<Json<ApiResponse<Vec<(Uuid, serde_json::Value)>>>, ApiError> {
-    let mut hits = Vec::new();
-    for shard in state.pool.each() {
-        if let Ok(mut rows) = shard.query_sql(&input.sql) {
-            hits.append(&mut rows);
+) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
+    let dialect = GenericDialect {};
+    let ast = Parser::parse_sql(&dialect, &input.sql)
+        .map_err(|e: sqlparser::parser::ParserError| ApiError::BadRequest(e.to_string()))?;
+    if ast.is_empty() {
+        return Err(ApiError::BadRequest("empty SQL".into()));
+    }
+    let first = &ast[0];
+    let is_select = matches!(first, sqlparser::ast::Statement::Query(_));
+    if is_select {
+        let mut rows = Vec::new();
+        for shard in state.pool.each() {
+            match shard.query_sql(&input.sql)? {
+                SqlResult::Select(mut r) => rows.append(&mut r),
+                _ => {}
+            }
         }
+        if let Some(limit) = input.limit {
+            rows.truncate(limit);
+        }
+        return Ok(Json(ApiResponse {
+            ok: true,
+            data: serde_json::json!({ "kind": "select", "rows": rows }),
+        }));
     }
-    if let Some(limit) = input.limit {
-        hits.truncate(limit);
+
+    // non-select: route to first shard (or broadcast for update/delete)
+    match first {
+        sqlparser::ast::Statement::Update { .. } | sqlparser::ast::Statement::Delete { .. } => {
+            let mut affected = 0usize;
+            for shard in state.pool.each() {
+            match shard.query_sql(&input.sql)? {
+                SqlResult::Update { affected: a } | SqlResult::Delete { affected: a } => {
+                    affected += a;
+                }
+                _ => {}
+            }
+        }
+            Ok(Json(ApiResponse {
+                ok: true,
+                data: serde_json::json!({ "kind": "write", "affected": affected }),
+            }))
+        }
+        sqlparser::ast::Statement::Insert { .. } => {
+            // choose shard 0 for now
+            let shard = state.pool.shards[0].clone();
+            match shard.query_sql(&input.sql)? {
+                SqlResult::Insert { ids } => Ok(Json(ApiResponse {
+                    ok: true,
+                    data: serde_json::json!({ "kind": "insert", "ids": ids }),
+                })),
+                _ => Err(ApiError::Internal(anyhow::anyhow!("unexpected result"))),
+            }
+        }
+        _ => Err(ApiError::BadRequest(
+            "statement type not supported in /v1/sql".into(),
+        )),
     }
-    Ok(Json(ApiResponse { ok: true, data: hits }))
+}
+
+async fn set_schema(
+    State(state): State<AppState>,
+    Json(input): Json<SchemaInput>,
+) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
+    let def = SchemaDef {
+        fields: input.fields,
+    };
+    match input.family.as_str() {
+        "doc" | "docs" | "collection" | "collections" => {
+            for shard in state.pool.each() {
+                shard.set_doc_schema(input.namespace.as_deref(), Some(&input.name), def.clone())?;
+            }
+        }
+        "row" | "rows" | "table" | "tables" => {
+            for shard in state.pool.each() {
+                shard.set_row_schema(input.namespace.as_deref(), Some(&input.name), def.clone())?;
+            }
+        }
+        _ => return Err(ApiError::BadRequest("family must be doc or row".into())),
+    }
+    Ok(Json(ApiResponse {
+        ok: true,
+        data: "schema set",
+    }))
 }
 
 async fn query_rows(
@@ -466,8 +554,11 @@ async fn query_rows(
     let mut hits = Vec::new();
     if let Some(sql) = input.sql {
         for shard in state.pool.each() {
-            if let Ok(mut rows) = shard.query_sql(&sql) {
-                hits.append(&mut rows);
+            match shard.query_sql(&sql)? {
+                SqlResult::Select(mut rows) => {
+                    hits.append(&mut rows);
+                }
+                _ => return Err(ApiError::BadRequest("SQL must be SELECT".into())),
             }
         }
         if let Some(limit) = input.limit {
@@ -849,6 +940,8 @@ async fn metrics(
 enum ApiError {
     NotFound,
     WrongShard,
+    BadRequest(String),
+    Conflict(String),
     Internal(anyhow::Error),
 }
 
@@ -857,6 +950,10 @@ impl From<PieskieoError> for ApiError {
         match value {
             PieskieoError::NotFound => ApiError::NotFound,
             PieskieoError::WrongShard => ApiError::WrongShard,
+            PieskieoError::Validation(msg) => ApiError::BadRequest(msg),
+            PieskieoError::UniqueViolation(field) => {
+                ApiError::Conflict(format!("unique constraint on field {field}"))
+            }
             other => ApiError::Internal(anyhow::Error::new(other)),
         }
     }
@@ -868,6 +965,8 @@ impl axum::response::IntoResponse for ApiError {
         match self {
             ApiError::NotFound => StatusCode::NOT_FOUND.into_response(),
             ApiError::WrongShard => StatusCode::CONFLICT.into_response(),
+            ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
+            ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
             ApiError::Internal(err) => {
                 tracing::error!("api_error" = %err);
                 StatusCode::INTERNAL_SERVER_ERROR.into_response()

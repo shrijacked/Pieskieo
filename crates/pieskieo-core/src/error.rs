@@ -12,6 +12,10 @@ pub enum PieskieoError {
     NotFound,
     #[error("wrong shard")]
     WrongShard,
+    #[error("validation error: {0}")]
+    Validation(String),
+    #[error("unique constraint violation on field '{0}'")]
+    UniqueViolation(String),
     #[error("internal error: {0}")]
     Internal(String),
 }

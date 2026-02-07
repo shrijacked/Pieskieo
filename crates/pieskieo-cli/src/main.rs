@@ -1,9 +1,13 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use serde::Deserialize;
 use pieskieo_core::{PieskieoDb, VectorParams};
 use pieskieo_server;
 use serde_json::Value;
 use std::io::{self, Write};
+use std::time::Instant;
+use reqwest::blocking::Client;
+use rustyline::DefaultEditor;
 use std::path::PathBuf;
 use tokio::runtime::Runtime;
 
@@ -17,6 +21,10 @@ struct Cli {
     /// Start HTTP server instead of embedded CLI ops
     #[arg(long)]
     serve: bool,
+
+    /// Target server URL (enables network mode similar to psql)
+    #[arg(long, env = "PIESKIEO_URL")]
+    server_url: Option<String>,
 
     /// Address to bind when serving
     #[arg(long, default_value = "0.0.0.0:8000")]
@@ -42,6 +50,11 @@ enum Commands {
         namespace: Option<String>,
         #[arg(long)]
         collection: Option<String>,
+    },
+    /// Execute a SQL/PQL statement against the server (--server-url required)
+    Sql {
+        #[arg(long)]
+        sql: String,
     },
     /// Query documents with exact-match filters
     QueryDoc {
@@ -87,6 +100,24 @@ fn main() -> Result<()> {
         // hand off to server main
         let rt = Runtime::new()?;
         return rt.block_on(pieskieo_server::serve());
+    }
+
+    // network mode
+    if let Some(base_url) = cli.server_url.clone() {
+        let token = std::env::var("PIESKIEO_TOKEN").ok();
+        let client = reqwest::blocking::Client::builder()
+            .user_agent("pieskieo-cli")
+            .build()?;
+        if cli.repl || matches!(cli.command, Some(Commands::Repl)) || cli.command.is_none() {
+            return run_net_repl(&client, &base_url, token.as_deref());
+        }
+        if let Some(Commands::Sql { sql }) = cli.command {
+            let data = net_query_sql(&client, &base_url, token.as_deref(), &sql)?;
+            println!("{}", data);
+            return Ok(());
+        }
+        println!("In network mode (--server-url). Use --repl or Sql command.");
+        return Ok(());
     }
 
     // embedded mode
@@ -167,6 +198,7 @@ fn main() -> Result<()> {
             }
         }
         Some(Commands::Repl) => unreachable!(), // handled above
+        Some(Commands::Sql { .. }) => unreachable!(), // handled in network mode
         None => {
             println!("No command given. Use --help for usage, or run with --repl.");
         }
@@ -267,6 +299,70 @@ fn run_repl(db: PieskieoDb) -> Result<()> {
                 }
             }
             _ => println!("unknown command"),
+        }
+    }
+    Ok(())
+}
+
+fn net_query_sql(
+    client: &Client,
+    base: &str,
+    token: Option<&str>,
+    sql: &str,
+) -> Result<String> {
+    #[derive(serde::Deserialize)]
+    struct Resp {
+        ok: bool,
+        data: serde_json::Value,
+    }
+    let mut req = client.post(format!("{}/v1/sql", base)).json(&serde_json::json!({ "sql": sql }));
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+    let resp = req.send()?.error_for_status()?;
+    let parsed: Resp = resp.json()?;
+    if !parsed.ok {
+        anyhow::bail!("server returned ok=false");
+    }
+    Ok(serde_json::to_string_pretty(&parsed.data)?)
+}
+
+fn run_net_repl(client: &Client, base: &str, token: Option<&str>) -> Result<()> {
+    let mut rl = DefaultEditor::new().ok();
+    println!("Pieskieo network shell. Type SQL/PQL statements; 'quit' to exit.");
+    loop {
+        let prompt = "pieskieo(net)> ";
+        let line = if let Some(ref mut editor) = rl {
+            match editor.readline(prompt) {
+                Ok(l) => {
+                    let _ = editor.add_history_entry(l.as_str());
+                    l
+                }
+                Err(_) => break,
+            }
+        } else {
+            print!("{prompt}");
+            io::stdout().flush()?;
+            let mut buf = String::new();
+            if io::stdin().read_line(&mut buf)? == 0 {
+                break;
+            }
+            buf
+        };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.eq_ignore_ascii_case("quit") || line.eq_ignore_ascii_case("exit") {
+            break;
+        }
+        let start = Instant::now();
+        match net_query_sql(client, base, token, line) {
+            Ok(out) => {
+                let elapsed = start.elapsed();
+                println!("{out}\n({:.2?})", elapsed);
+            }
+            Err(e) => eprintln!("error: {e}"),
         }
     }
     Ok(())

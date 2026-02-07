@@ -1302,6 +1302,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sqlparser",
  "tokio",
  "tower 0.4.13",
  "tracing",
