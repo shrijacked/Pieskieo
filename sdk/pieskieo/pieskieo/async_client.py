@@ -189,7 +189,12 @@ class AsyncPieskieoClient:
         offset: int = 0,
         namespace: Optional[str] = None,
         collection: Optional[str] = None,
+        sql: Optional[str] = None,
     ) -> List:
+        if sql:
+            r = await self.client.post(f"{self.base}/v1/doc/query", json={"sql": sql})
+            r.raise_for_status()
+            return r.json()["data"]
         payload = {"filter": filter, "limit": limit, "offset": offset}
         if namespace:
             payload["namespace"] = namespace
@@ -206,7 +211,12 @@ class AsyncPieskieoClient:
         offset: int = 0,
         namespace: Optional[str] = None,
         table: Optional[str] = None,
+        sql: Optional[str] = None,
     ) -> List:
+        if sql:
+            r = await self.client.post(f"{self.base}/v1/row/query", json={"sql": sql})
+            r.raise_for_status()
+            return r.json()["data"]
         payload = {"filter": filter, "limit": limit, "offset": offset}
         if namespace:
             payload["namespace"] = namespace

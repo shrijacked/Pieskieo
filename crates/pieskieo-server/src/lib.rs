@@ -35,6 +35,7 @@ struct QueryInput {
     collection: Option<String>,
     table: Option<String>,
     offset: Option<usize>,
+    sql: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -409,14 +410,25 @@ async fn query_docs(
     Json(input): Json<QueryInput>,
 ) -> Result<Json<ApiResponse<Vec<(Uuid, serde_json::Value)>>>, ApiError> {
     let mut hits = Vec::new();
-    for shard in state.pool.each() {
-        hits.extend(shard.query_docs_ns(
-            input.namespace.as_deref(),
-            input.collection.as_deref(),
-            &input.filter,
-            input.limit.unwrap_or(100),
-            input.offset.unwrap_or(0),
-        ));
+    if let Some(sql) = input.sql {
+        for shard in state.pool.each() {
+            if let Ok(mut rows) = shard.query_sql(&sql) {
+                hits.append(&mut rows);
+            }
+        }
+        if let Some(limit) = input.limit {
+            hits.truncate(limit);
+        }
+    } else {
+        for shard in state.pool.each() {
+            hits.extend(shard.query_docs_ns(
+                input.namespace.as_deref(),
+                input.collection.as_deref(),
+                &input.filter,
+                input.limit.unwrap_or(100),
+                input.offset.unwrap_or(0),
+            ));
+        }
     }
     Ok(Json(ApiResponse {
         ok: true,
@@ -429,14 +441,25 @@ async fn query_rows(
     Json(input): Json<QueryInput>,
 ) -> Result<Json<ApiResponse<Vec<(Uuid, serde_json::Value)>>>, ApiError> {
     let mut hits = Vec::new();
-    for shard in state.pool.each() {
-        hits.extend(shard.query_rows_ns(
-            input.namespace.as_deref(),
-            input.table.as_deref(),
-            &input.filter,
-            input.limit.unwrap_or(100),
-            input.offset.unwrap_or(0),
-        ));
+    if let Some(sql) = input.sql {
+        for shard in state.pool.each() {
+            if let Ok(mut rows) = shard.query_sql(&sql) {
+                hits.append(&mut rows);
+            }
+        }
+        if let Some(limit) = input.limit {
+            hits.truncate(limit);
+        }
+    } else {
+        for shard in state.pool.each() {
+            hits.extend(shard.query_rows_ns(
+                input.namespace.as_deref(),
+                input.table.as_deref(),
+                &input.filter,
+                input.limit.unwrap_or(100),
+                input.offset.unwrap_or(0),
+            ));
+        }
     }
     Ok(Json(ApiResponse {
         ok: true,

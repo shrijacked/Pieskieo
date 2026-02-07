@@ -29,6 +29,9 @@ rows = c.query_rows({"item": "widget"}, namespace="team-a", table="orders")
 # Pagination
 rows_page_2 = c.query_rows({"item": "widget"}, limit=50, offset=50, namespace="team-a", table="orders")
 
+# SQL-like queries
+docs = c.query_docs(sql="SELECT * FROM team-a.users WHERE user = 'alice' LIMIT 10")
+
 # Async client
 import asyncio
 from pieskieo import AsyncPieskieoClient, models
