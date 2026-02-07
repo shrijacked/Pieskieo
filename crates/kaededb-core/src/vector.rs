@@ -1,11 +1,12 @@
 use crate::error::{KaedeDbError, Result};
-use hnsw_rs::prelude::*;
+use hnsw_rs::{hnswio::HnswIo, prelude::*};
 use parking_lot::RwLock;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
+use std::mem::transmute;
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -444,8 +445,39 @@ impl VectorIndex {
     }
 
     /// Load HNSW graph and mappings if present.
-    /// Note: hnsw_rs currently lacks a stable load API; return false to trigger rebuild.
-    pub fn load_hnsw(&self, _path: impl AsRef<Path>) -> Result<bool> {
+    pub fn load_hnsw(&self, path: impl AsRef<Path>) -> Result<bool> {
+        let p = path.as_ref();
+        let dir = p.parent().unwrap_or_else(|| Path::new("."));
+        let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("hnsw");
+        let map_path = dir.join(format!("{stem}.map.bin"));
+        if !map_path.exists() {
+            return Ok(false);
+        }
+        let mut reloader = HnswIo::new(dir, stem);
+        if let Ok(hnsw_loaded) = reloader.load_hnsw::<f32, DistL2>() {
+            // SAFETY: hnsw_io materializes owned data; we transmute lifetime to store in 'static slot.
+            let hnsw: Hnsw<'static, f32, DistL2> = unsafe { transmute(hnsw_loaded) };
+            let (rev_map, next_id): (Vec<Uuid>, usize) =
+                bincode::deserialize(&std::fs::read(&map_path)?)?;
+            {
+                let mut rev_guard = self.rev_map.write();
+                *rev_guard = rev_map;
+            }
+            self.next_id.store(next_id, Ordering::SeqCst);
+            {
+                let mut id_map = self.id_map.write();
+                id_map.clear();
+                let rev_guard = self.rev_map.read();
+                for (internal, uid) in rev_guard.iter().enumerate() {
+                    if *uid != Uuid::nil() {
+                        id_map.insert(*uid, internal);
+                    }
+                }
+            }
+            *self.hnsw.write() = Some(hnsw);
+            self.owned_store.write().clear();
+            return Ok(true);
+        }
         Ok(false)
     }
 
