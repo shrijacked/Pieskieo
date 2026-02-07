@@ -24,3 +24,4 @@ async-trait.workspace = true
 tempfile.workspace = true
 rayon.workspace = true
 hnsw_rs.workspace = true
+sysinfo = "0.30"
