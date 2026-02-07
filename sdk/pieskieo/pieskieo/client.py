@@ -83,6 +83,38 @@ class PieskieoClient:
         r = self.client.delete(f"{self.base}/v1/doc/{id}")
         r.raise_for_status()
 
+    # -------- rows --------
+    def put_row(self, data, id: Optional[uuid.UUID] = None) -> uuid.UUID:
+        row_id = id or uuid.uuid4()
+        r = self.client.post(f"{self.base}/v1/row", json={"id": str(row_id), "data": data})
+        r.raise_for_status()
+        return row_id
+
+    def get_row(self, id: uuid.UUID):
+        r = self.client.get(f"{self.base}/v1/row/{id}")
+        r.raise_for_status()
+        return r.json()["data"]
+
+    def delete_row(self, id: uuid.UUID):
+        r = self.client.delete(f"{self.base}/v1/row/{id}")
+        r.raise_for_status()
+
+    # -------- graph --------
+    def add_edge(self, src: uuid.UUID, dst: uuid.UUID, weight: float = 1.0):
+        r = self.client.post(
+            f"{self.base}/v1/graph/edge",
+            json={"src": str(src), "dst": str(dst), "weight": weight},
+        )
+        r.raise_for_status()
+
+    def neighbors(self, id: uuid.UUID, limit: int = 100):
+        r = self.client.get(f"{self.base}/v1/graph/{id}")
+        r.raise_for_status()
+        data = r.json()["data"]
+        if limit and len(data) > limit:
+            return data[:limit]
+        return data
+
     def close(self):
         self.client.close()
 
