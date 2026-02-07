@@ -56,7 +56,8 @@ jobs:
         run: |
           cargo build --release --target ${{ matrix.target }} --locked
 
-      - name: Package
+      - name: Package (unix)
+        if: matrix.os != 'windows-2022'
         shell: bash
         run: |
           mkdir -p dist
@@ -69,6 +70,23 @@ jobs:
             "${BIN_DIR}/load${{ matrix.bin-suffix }}" \
             "${BIN_DIR}/bench${{ matrix.bin-suffix }}"
           echo "ARCHIVE=${ARCHIVE}" >> $GITHUB_ENV
+
+      - name: Package (windows)
+        if: matrix.os == 'windows-2022'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $BinDir = "target/${{ matrix.target }}/release"
+          $Version = "${env:GITHUB_REF_NAME}"
+          $Archive = "pieskieo-${{ matrix.archive }}-$Version.zip"
+          $Files = @(
+            "$BinDir/pieskieo${{ matrix.bin-suffix }}",
+            "$BinDir/pieskieo-server${{ matrix.bin-suffix }}",
+            "$BinDir/load${{ matrix.bin-suffix }}",
+            "$BinDir/bench${{ matrix.bin-suffix }}"
+          )
+          Compress-Archive -Path $Files -DestinationPath "dist/$Archive" -Force
+          "ARCHIVE=$Archive" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
