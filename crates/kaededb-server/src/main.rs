@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 #[derive(Clone)]
 struct AppState {
-    db: Arc<KaedeDb>,
+    pool: Arc<DbPool>,
 }
 
 #[derive(Deserialize)]
@@ -89,6 +89,75 @@ struct VectorOutput {
     meta: Option<HashMap<String, String>>,
 }
 
+struct DbPool {
+    shards: Vec<Arc<KaedeDb>>,
+}
+
+impl DbPool {
+    fn new(base_dir: &str, params: KaedeDbVectorParams, shards: usize) -> anyhow::Result<Self> {
+        let mut v = Vec::with_capacity(shards.max(1));
+        for i in 0..shards.max(1) {
+            let mut p = params.clone();
+            p.shard_id = i;
+            p.shard_total = shards.max(1);
+            let dir = if shards > 1 {
+                format!("{base_dir}/shard{i}")
+            } else {
+                base_dir.to_string()
+            };
+            std::fs::create_dir_all(&dir)?;
+            v.push(Arc::new(KaedeDb::open_with_params(&dir, p)?));
+        }
+        Ok(Self { shards: v })
+    }
+
+    fn shard_for(&self, id: &Uuid) -> Arc<KaedeDb> {
+        if self.shards.len() == 1 {
+            return self.shards[0].clone();
+        }
+        let mut arr = [0u8; 8];
+        arr.copy_from_slice(&id.as_bytes()[..8]);
+        let idx = (u64::from_le_bytes(arr) as usize) % self.shards.len();
+        self.shards[idx].clone()
+    }
+
+    fn each(&self) -> impl Iterator<Item = Arc<KaedeDb>> + '_ {
+        self.shards.iter().cloned()
+    }
+
+    fn aggregate_metrics(&self) -> kaededb_core::engine::MetricsSnapshot {
+        let mut agg = kaededb_core::engine::MetricsSnapshot {
+            docs: 0,
+            rows: 0,
+            vectors: 0,
+            vector_tombstones: 0,
+            hnsw_ready: true,
+            ef_search: 0,
+            ef_construction: 0,
+            wal_path: std::path::PathBuf::new(),
+            wal_bytes: 0,
+            snapshot_mtime: None,
+            link_top_k: 0,
+            shard_id: 0,
+            shard_total: self.shards.len(),
+        };
+        for shard in &self.shards {
+            let m = shard.metrics();
+            agg.docs += m.docs;
+            agg.rows += m.rows;
+            agg.vectors += m.vectors;
+            agg.vector_tombstones += m.vector_tombstones;
+            agg.hnsw_ready &= m.hnsw_ready;
+            agg.ef_search = m.ef_search;
+            agg.ef_construction = m.ef_construction;
+            agg.link_top_k = m.link_top_k;
+            agg.wal_bytes += m.wal_bytes;
+            agg.snapshot_mtime = agg.snapshot_mtime.or(m.snapshot_mtime);
+        }
+        agg
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -97,9 +166,10 @@ async fn main() -> anyhow::Result<()> {
 
     let data_dir = std::env::var("KAEDEDB_DATA").unwrap_or_else(|_| "data".to_string());
     let params = vector_params_from_env();
-    let db = Arc::new(KaedeDb::open_with_params(&data_dir, params)?);
+    let shards = params.shard_total.max(1);
+    let pool = Arc::new(DbPool::new(&data_dir, params, shards)?);
 
-    let state = AppState { db };
+    let state = AppState { pool };
 
     // background WAL flusher (group commit) for better latency.
     let flush_ms = std::env::var("KAEDEDB_WAL_FLUSH_MS")
@@ -107,13 +177,15 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(50);
     {
-        let db = state.db.clone();
+        let pool = state.pool.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(flush_ms));
             loop {
                 interval.tick().await;
-                if let Err(e) = db.flush_wal() {
-                    tracing::warn!("wal flush failed: {e}");
+                for shard in pool.each() {
+                    if let Err(e) = shard.flush_wal() {
+                        tracing::warn!("wal flush failed: {e}");
+                    }
                 }
             }
         });
@@ -121,13 +193,15 @@ async fn main() -> anyhow::Result<()> {
 
     if let Ok(secs) = std::env::var("KAEDEDB_SNAPSHOT_INTERVAL_SECS") {
         if let Ok(secs) = secs.parse::<u64>() {
-            let db = state.db.clone();
+            let pool = state.pool.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(secs));
                 loop {
                     interval.tick().await;
-                    if let Err(e) = db.save_vector_snapshot() {
-                        tracing::warn!("snapshot save failed: {e}");
+                    for shard in pool.each() {
+                        if let Err(e) = shard.save_vector_snapshot() {
+                            tracing::warn!("snapshot save failed: {e}");
+                        }
                     }
                 }
             });
@@ -136,13 +210,15 @@ async fn main() -> anyhow::Result<()> {
 
     if let Ok(secs) = std::env::var("KAEDEDB_REBUILD_INTERVAL_SECS") {
         if let Ok(secs) = secs.parse::<u64>() {
-            let db = state.db.clone();
+            let pool = state.pool.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(secs));
                 loop {
                     interval.tick().await;
-                    if let Err(e) = db.rebuild_vectors() {
-                        tracing::warn!("vector rebuild failed: {e}");
+                    for shard in pool.each() {
+                        if let Err(e) = shard.rebuild_vectors() {
+                            tracing::warn!("vector rebuild failed: {e}");
+                        }
                     }
                 }
             });
@@ -238,7 +314,11 @@ async fn put_doc(
     Json(input): Json<DocInput>,
 ) -> Result<Json<ApiResponse<Uuid>>, ApiError> {
     let id = input.id.unwrap_or_else(Uuid::new_v4);
-    state.db.put_doc(id, input.data).map_err(ApiError::from)?;
+    state
+        .pool
+        .shard_for(&id)
+        .put_doc(id, input.data)
+        .map_err(ApiError::from)?;
     Ok(Json(ApiResponse { ok: true, data: id }))
 }
 
@@ -246,7 +326,11 @@ async fn get_doc(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
-    let doc = state.db.get_doc(&id).ok_or(ApiError::NotFound)?;
+    let doc = state
+        .pool
+        .shard_for(&id)
+        .get_doc(&id)
+        .ok_or(ApiError::NotFound)?;
     Ok(Json(ApiResponse {
         ok: true,
         data: doc,
@@ -257,7 +341,11 @@ async fn delete_doc(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
-    state.db.delete_doc(&id).map_err(ApiError::from)?;
+    state
+        .pool
+        .shard_for(&id)
+        .delete_doc(&id)
+        .map_err(ApiError::from)?;
     Ok(Json(ApiResponse {
         ok: true,
         data: "deleted",
@@ -269,7 +357,11 @@ async fn put_row(
     Json(input): Json<RowInput>,
 ) -> Result<Json<ApiResponse<Uuid>>, ApiError> {
     let id = input.id.unwrap_or_else(Uuid::new_v4);
-    state.db.put_row(id, &input.data).map_err(ApiError::from)?;
+    state
+        .pool
+        .shard_for(&id)
+        .put_row(id, &input.data)
+        .map_err(ApiError::from)?;
     Ok(Json(ApiResponse { ok: true, data: id }))
 }
 
@@ -277,7 +369,11 @@ async fn get_row(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
-    let row = state.db.get_row(&id).ok_or(ApiError::NotFound)?;
+    let row = state
+        .pool
+        .shard_for(&id)
+        .get_row(&id)
+        .ok_or(ApiError::NotFound)?;
     Ok(Json(ApiResponse {
         ok: true,
         data: row,
@@ -288,7 +384,11 @@ async fn delete_row(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
-    state.db.delete_row(&id).map_err(ApiError::from)?;
+    state
+        .pool
+        .shard_for(&id)
+        .delete_row(&id)
+        .map_err(ApiError::from)?;
     Ok(Json(ApiResponse {
         ok: true,
         data: "deleted",
@@ -300,7 +400,8 @@ async fn put_vector(
     Json(input): Json<VectorInput>,
 ) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
     state
-        .db
+        .pool
+        .shard_for(&input.id)
         .put_vector_with_meta(input.id, input.vector, input.meta)
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse {
@@ -316,7 +417,8 @@ async fn put_vector_bulk(
     let mut stored = 0usize;
     for item in input.items {
         state
-            .db
+            .pool
+            .shard_for(&item.id)
             .put_vector_with_meta(item.id, item.vector.clone(), item.meta.clone())
             .map_err(ApiError::from)?;
         stored += 1;
@@ -331,7 +433,11 @@ async fn delete_vector(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
-    state.db.delete_vector(&id).map_err(ApiError::from)?;
+    state
+        .pool
+        .shard_for(&id)
+        .delete_vector(&id)
+        .map_err(ApiError::from)?;
     Ok(Json(ApiResponse {
         ok: true,
         data: "deleted",
@@ -342,7 +448,11 @@ async fn get_vector(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ApiResponse<VectorOutput>>, ApiError> {
-    let (vector, meta) = state.db.get_vector(&id).ok_or(ApiError::NotFound)?;
+    let (vector, meta) = state
+        .pool
+        .shard_for(&id)
+        .get_vector(&id)
+        .ok_or(ApiError::NotFound)?;
     Ok(Json(ApiResponse {
         ok: true,
         data: VectorOutput { id, vector, meta },
@@ -355,7 +465,8 @@ async fn update_vector_meta(
     Json(input): Json<VectorMetaInput>,
 ) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
     state
-        .db
+        .pool
+        .shard_for(&id)
         .update_vector_meta(id, input.meta)
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse {
@@ -370,7 +481,8 @@ async fn delete_vector_meta_keys(
     Json(input): Json<VectorMetaDeleteInput>,
 ) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
     state
-        .db
+        .pool
+        .shard_for(&id)
         .remove_vector_meta_keys(id, &input.keys)
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse {
@@ -392,14 +504,23 @@ async fn search_vector(
     };
 
     if let Some(ef) = input.ef_search {
-        state.db.set_ef_search(ef);
+        for shard in state.pool.each() {
+            shard.set_ef_search(ef);
+        }
     }
 
     // For now metric selection is per-query; in future persist per-index config.
-    let mut hits =
-        state
-            .db
-            .search_vector_metric(&input.query, k, metric, input.filter_meta.clone())?;
+    let mut all_hits = Vec::new();
+    for shard in state.pool.each() {
+        if let Ok(mut h) =
+            shard.search_vector_metric(&input.query, k, metric, input.filter_meta.clone())
+        {
+            all_hits.append(&mut h);
+        }
+    }
+    all_hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+    all_hits.truncate(k);
+    let mut hits = all_hits;
     if let Some(filter_ids) = input.filter_ids {
         let allow: std::collections::HashSet<Uuid> = filter_ids.into_iter().collect();
         hits.retain(|h| allow.contains(&h.id));
@@ -415,19 +536,22 @@ async fn update_vector_config(
     Json(input): Json<VectorConfigInput>,
 ) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
     if let Some(ef) = input.ef_search {
-        state.db.set_ef_search(ef);
+        for shard in state.pool.each() {
+            shard.set_ef_search(ef);
+        }
     }
     if let Some(efc) = input.ef_construction {
-        state.db.set_ef_construction(efc);
+        for shard in state.pool.each() {
+            shard.set_ef_construction(efc);
+        }
     }
     if let Some(k) = input.link_top_k {
-        // Arc<KaedeDb> is shared; clone then try to get mutable ref if no other owners.
-        let mut db_arc = state.db.clone();
-        if let Some(db_mut) = Arc::get_mut(&mut db_arc) {
-            db_mut.set_link_top_k(k);
-        } else {
-            // Fallback: log and skip if currently in use by other handles.
-            tracing::warn!("link_top_k update skipped (db state is shared)");
+        for shard in state.pool.each() {
+            if let Some(db_mut) = Arc::get_mut(&mut shard.clone()) {
+                db_mut.set_link_top_k(k);
+            } else {
+                tracing::warn!("link_top_k update skipped (db state is shared)");
+            }
         }
     }
     Ok(Json(ApiResponse {
@@ -439,7 +563,9 @@ async fn update_vector_config(
 async fn rebuild_vectors(
     State(state): State<AppState>,
 ) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
-    state.db.rebuild_vectors().map_err(ApiError::from)?;
+    for shard in state.pool.each() {
+        shard.rebuild_vectors().map_err(ApiError::from)?;
+    }
     Ok(Json(ApiResponse {
         ok: true,
         data: "rebuilt",
@@ -449,7 +575,9 @@ async fn rebuild_vectors(
 async fn vacuum_vectors(
     State(state): State<AppState>,
 ) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
-    state.db.vacuum().map_err(ApiError::from)?;
+    for shard in state.pool.each() {
+        shard.vacuum().map_err(ApiError::from)?;
+    }
     Ok(Json(ApiResponse {
         ok: true,
         data: "vacuumed",
@@ -459,7 +587,9 @@ async fn vacuum_vectors(
 async fn save_snapshot(
     State(state): State<AppState>,
 ) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
-    state.db.save_vector_snapshot().map_err(ApiError::from)?;
+    for shard in state.pool.each() {
+        shard.save_vector_snapshot().map_err(ApiError::from)?;
+    }
     Ok(Json(ApiResponse {
         ok: true,
         data: "saved",
@@ -472,7 +602,8 @@ async fn add_edge(
 ) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
     let weight = input.weight.unwrap_or(1.0);
     state
-        .db
+        .pool
+        .shard_for(&input.src)
         .add_edge(input.src, input.dst, weight)
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse {
@@ -485,7 +616,7 @@ async fn list_neighbors(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ApiResponse<Vec<kaededb_core::Edge>>>, ApiError> {
-    let edges = state.db.neighbors(id, 100);
+    let edges = state.pool.shard_for(&id).neighbors(id, 100);
     Ok(Json(ApiResponse {
         ok: true,
         data: edges,
@@ -496,13 +627,13 @@ async fn which_shard(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ApiResponse<HashMap<&'static str, usize>>>, ApiError> {
-    let metrics = state.db.metrics();
+    let shard_total = state.pool.shards.len();
     let mut arr = [0u8; 8];
     arr.copy_from_slice(&id.as_bytes()[..8]);
-    let shard_id = (u64::from_le_bytes(arr) as usize) % metrics.shard_total;
+    let shard_id = (u64::from_le_bytes(arr) as usize) % shard_total;
     let mut map = HashMap::new();
     map.insert("shard_id", shard_id);
-    map.insert("shard_total", metrics.shard_total);
+    map.insert("shard_total", shard_total);
     Ok(Json(ApiResponse {
         ok: true,
         data: map,
@@ -512,7 +643,7 @@ async fn which_shard(
 async fn metrics(
     State(state): State<AppState>,
 ) -> Result<impl axum::response::IntoResponse, ApiError> {
-    let m = state.db.metrics();
+    let m = state.pool.aggregate_metrics();
     let body = format!(
         "kaededb_docs {}\nkaededb_rows {}\nkaededb_vectors {}\nkaededb_vector_tombstones {}\nkaededb_hnsw_ready {}\nkaededb_ef_search {}\nkaededb_ef_construction {}\nkaededb_link_top_k {}\nkaededb_shard_id {}\nkaededb_shard_total {}\n",
         m.docs,
