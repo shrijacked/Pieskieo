@@ -192,9 +192,7 @@ class AsyncPieskieoClient:
         sql: Optional[str] = None,
     ) -> List:
         if sql:
-            r = await self.client.post(f"{self.base}/v1/doc/query", json={"sql": sql})
-            r.raise_for_status()
-            return r.json()["data"]
+            return await self.query_sql(sql, limit)
         payload = {"filter": filter, "limit": limit, "offset": offset}
         if namespace:
             payload["namespace"] = namespace
@@ -214,15 +212,21 @@ class AsyncPieskieoClient:
         sql: Optional[str] = None,
     ) -> List:
         if sql:
-            r = await self.client.post(f"{self.base}/v1/row/query", json={"sql": sql})
-            r.raise_for_status()
-            return r.json()["data"]
+            return await self.query_sql(sql, limit)
         payload = {"filter": filter, "limit": limit, "offset": offset}
         if namespace:
             payload["namespace"] = namespace
         if table:
             payload["table"] = table
         r = await self.client.post(f"{self.base}/v1/row/query", json=payload)
+        r.raise_for_status()
+        return r.json()["data"]
+
+    async def query_sql(self, sql: str, limit: Optional[int] = None) -> List:
+        payload = {"sql": sql}
+        if limit is not None:
+            payload["limit"] = limit
+        r = await self.client.post(f"{self.base}/v1/sql", json=payload)
         r.raise_for_status()
         return r.json()["data"]
 

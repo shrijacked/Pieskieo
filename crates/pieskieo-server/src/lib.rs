@@ -39,6 +39,12 @@ struct QueryInput {
 }
 
 #[derive(Deserialize)]
+struct SqlInput {
+    sql: String,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
 struct VectorInput {
     id: Uuid,
     vector: Vec<f32>,
@@ -271,6 +277,7 @@ pub async fn serve() -> anyhow::Result<()> {
         .route("/v1/vector/snapshot/save", post(save_snapshot))
         .route("/v1/vector/bulk", post(put_vector_bulk))
         .route("/v1/vector/:id", delete(delete_vector))
+        .route("/v1/sql", post(query_sql))
         .route("/metrics", get(metrics))
         .route("/v1/graph/edge", post(add_edge))
         .route("/v1/graph/:id", get(list_neighbors))
@@ -434,6 +441,22 @@ async fn query_docs(
         ok: true,
         data: hits,
     }))
+}
+
+async fn query_sql(
+    State(state): State<AppState>,
+    Json(input): Json<SqlInput>,
+) -> Result<Json<ApiResponse<Vec<(Uuid, serde_json::Value)>>>, ApiError> {
+    let mut hits = Vec::new();
+    for shard in state.pool.each() {
+        if let Ok(mut rows) = shard.query_sql(&input.sql) {
+            hits.append(&mut rows);
+        }
+    }
+    if let Some(limit) = input.limit {
+        hits.truncate(limit);
+    }
+    Ok(Json(ApiResponse { ok: true, data: hits }))
 }
 
 async fn query_rows(

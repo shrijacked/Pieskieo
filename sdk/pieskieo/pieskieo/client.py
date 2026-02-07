@@ -173,9 +173,7 @@ class PieskieoClient:
         sql: Optional[str] = None,
     ) -> List:
         if sql:
-            r = self.client.post(f"{self.base}/v1/doc/query", json={"sql": sql})
-            r.raise_for_status()
-            return r.json()["data"]
+            return self.query_sql(sql, limit)
         payload = {"filter": filter, "limit": limit, "offset": offset}
         if namespace:
             payload["namespace"] = namespace
@@ -195,15 +193,21 @@ class PieskieoClient:
         sql: Optional[str] = None,
     ) -> List:
         if sql:
-            r = self.client.post(f"{self.base}/v1/row/query", json={"sql": sql})
-            r.raise_for_status()
-            return r.json()["data"]
+            return self.query_sql(sql, limit)
         payload = {"filter": filter, "limit": limit, "offset": offset}
         if namespace:
             payload["namespace"] = namespace
         if table:
             payload["table"] = table
         r = self.client.post(f"{self.base}/v1/row/query", json=payload)
+        r.raise_for_status()
+        return r.json()["data"]
+
+    def query_sql(self, sql: str, limit: Optional[int] = None) -> List:
+        payload = {"sql": sql}
+        if limit is not None:
+            payload["limit"] = limit
+        r = self.client.post(f"{self.base}/v1/sql", json=payload)
         r.raise_for_status()
         return r.json()["data"]
 
