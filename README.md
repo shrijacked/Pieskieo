@@ -1,43 +1,53 @@
-# KaedeDB (alpha)
+# Pieskieo
 
-A Rust-first multimodal database engine that unifies document (Mongo-like), relational (Postgres-like), vector (Weaviate-like), and graph (mesh) primitives under one binary. The current drop provides an MVP storage core and HTTP API scaffold ready to extend toward production.
+A Rust-first multimodal database engine combining document (Mongo-like), row (Postgres-ish), vector (Weaviate/Lance/Kuzu-ish), and mesh graph primitives in one binary. Current state: production-leaning MVP with HNSW ANN, metadata filters, automatic mesh links, snapshot/WAL durability, and internal sharding.
 
 ## Layout
-- `crates/kaededb-core`: storage engine (WAL, in-memory collections, vector index, graph adjacency) with MVCC-ready WAL replay.
-- `crates/kaededb-server`: Axum-based HTTP API exposing docs, vectors, and graph edges.
-- `tools/` (local only): toolchain helper downloads (e.g., llvm-mingw) used during setup.
+- `crates/pieskieo-core`: storage engine (WAL, snapshot, HNSW, vector metadata, graph mesh, auto-linking, shard enforcement).
+- `crates/pieskieo-server`: Axum HTTP API with transparent intra-process sharding and fan-out search, metrics, and load generator (`src/bin/load.rs`).
+- `tools/`: local toolchain helpers (mingw/llvm downloads).
 
 ## Build & run (Windows)
-1. Install Rust (already done via `rustup`).
-2. Install a C/C++ linker:
-   - Recommended: Visual Studio Build Tools 2022 with *Desktop C++* workload (gives `link.exe`).
-   - Alternative: MinGW-w64 + Rust `stable-x86_64-pc-windows-gnu` toolchain; set `CARGO_BUILD_TARGET=x86_64-pc-windows-gnu` and ensure `x86_64-w64-mingw32-gcc` with import libs is on `PATH`.
-3. From repo root: `cargo build` (or `cargo build --release`).
-4. Run server: `cargo run -p kaededb-server` (env: `KAEDEDB_DATA=./data`, `KAEDEDB_LISTEN=0.0.0.0:8000`).
+1. Rust toolchain installed.
+2. Linker: VS Build Tools (Desktop C++) **or** MinGW (set `PATH` to MinGW bin).
+3. Build: `cargo build --release`
+4. Run server:
+```
+PIESKIEO_DATA=./data \
+PIESKIEO_LISTEN=0.0.0.0:8000 \
+PIESKIEO_SHARD_TOTAL=1 \
+PIESKIEO_EF_SEARCH=50 \
+PIESKIEO_EF_CONSTRUCTION=200 \
+cargo run -p pieskieo-server --release
+```
 
-## API sketch (HTTP JSON)
-- `GET /healthz` ? `"ok"`
-- `POST /v1/doc` body `{ id?: uuid, data: json }` ? returns generated/used `id`.
-- `GET /v1/doc/:id` ? stored JSON.
-- `POST /v1/vector` body `{ id: uuid, vector: number[] }` ? store vector tied to id.
-- `POST /v1/vector/search` body `{ query: number[], k?: number }` ? top-k vector hits (linear L2 for now).
-- `POST /v1/graph/edge` body `{ src: uuid, dst: uuid, weight?: number }` ? add directed edge.
-- `GET /v1/graph/:id` ? neighbors for vertex id.
+## Key features
+- HNSW ANN with persistence (graph + revmap saved/reloaded).
+- Vector metadata upsert, filter, delete-keys.
+- Mesh graph with auto KNN linking per insert (configurable `PIESKIEO_LINK_K`).
+- Transparent sharding inside one process (hash on UUID); fan-out search merges top-k.
+- WAL + snapshot; vacuum to drop tombstones and truncate WAL.
+- Metrics endpoint (Prometheus text) including per-shard gauges.
 
-## Engine notes
-- WAL: length-prefixed bincode records (`wal.log` per data directory); replay bootstraps in-memory state.
-- Collections: `Doc` and `Row` buckets stored as JSON values for now; ready for columnar/LSM upgrade.
-- Vector index: in-memory store with L2 scoring (placeholder for HNSW/IVF/quantization).
-- Graph store: adjacency list with weight; integrates with WAL for durability.
-- Concurrency: coarse `RwLock` protecting collections; vector/graph stores are internally locked.
+## HTTP API (JSON)
+- Health: `GET /healthz`
+- Docs/rows: `POST /v1/doc`, `GET/DELETE /v1/doc/:id`; `POST /v1/row`, `GET/DELETE /v1/row/:id`
+- Vectors:
+  - `POST /v1/vector` `{id, vector, meta?}`
+  - `POST /v1/vector/bulk` `[{id, vector, meta?}]`
+  - `POST /v1/vector/search` `{query, k?, metric?, ef_search?, filter_ids?, filter_meta?}`
+  - `POST /v1/vector/:id/meta` `{meta}` (merge)
+  - `POST /v1/vector/:id/meta/delete` `{keys}`
+  - `GET /v1/vector/:id`
+  - `DELETE /v1/vector/:id`
+  - `POST /v1/vector/rebuild` | `POST /v1/vector/vacuum` | `POST /v1/vector/snapshot/save`
+- Graph: `POST /v1/graph/edge` `{src,dst,weight?}`, `GET /v1/graph/:id`
+- Shard info: `GET /v1/shard/which/:id`
+- Metrics: `GET /metrics`
 
-## Next steps
-- Swap linear vector search with HNSW + filters; add background indexer fed by WAL.
-- Implement SSTable/LSM flush/compaction and on-disk indices.
-- Add Cypher-lite planner and SQL/JSON bridging.
-- Cluster mesh: gossip membership + consistent hashing for shard routing.
-- Observability: tracing spans, metrics, structured errors.
+## Benchmark tools
+- Core bench: `cargo run -p pieskieo-core --bin bench --release -- <n> <dim> [ef_c] [ef_s]`
+- HTTP load: `cargo run -p pieskieo-server --bin load --release -- <url> <dim> <n_vec> <searches>`
 
-## Testing
-- Core crate includes async tests for doc/vector roundtrip and graph neighbors (`cargo test -p kaededb-core`).
-- Build currently blocked on missing Windows linker; install VS Build Tools or MinGW to run the suite.
+## License
+GPL-2.0-only (see LICENSE).
