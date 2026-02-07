@@ -488,6 +488,16 @@ struct AuthOpt {
 }
 
 fn net_query_sql(client: &Client, base: &str, auth: AuthOpt, sql: &str) -> Result<String> {
+    let (out, _) = net_query_sql_with_status(client, base, auth, sql)?;
+    Ok(out)
+}
+
+fn net_query_sql_with_status(
+    client: &Client,
+    base: &str,
+    auth: AuthOpt,
+    sql: &str,
+) -> Result<(String, Option<reqwest::StatusCode>)> {
     #[derive(Deserialize)]
     struct Resp {
         ok: bool,
@@ -501,12 +511,16 @@ fn net_query_sql(client: &Client, base: &str, auth: AuthOpt, sql: &str) -> Resul
     } else if let Some(user) = auth.basic_user {
         req = req.basic_auth(user, auth.basic_pass);
     }
-    let resp = req.send()?.error_for_status()?;
+    let resp = req.send()?;
+    let status = resp.status();
+    if !status.is_success() {
+        anyhow::bail!("HTTP status {} for /v1/sql", status);
+    }
     let parsed: Resp = resp.json()?;
     if !parsed.ok {
         anyhow::bail!("server returned ok=false");
     }
-    Ok(serde_json::to_string_pretty(&parsed.data)?)
+    Ok((serde_json::to_string_pretty(&parsed.data)?, Some(status)))
 }
 
 fn run_net_repl(client: &Client, base: &str, auth: AuthOpt) -> Result<()> {
@@ -526,8 +540,35 @@ fn run_net_repl_with_prompt(
     println!(
         "Pieskieo network shell connected to {target_disp} as {user_disp}. Type SQL/PQL statements; 'quit' to exit."
     );
+    // Basic-auth validation with retry prompt
+    if auth.basic_user.is_some() {
+        let mut attempt = 0;
+        let mut auth_mut = auth.clone();
+        loop {
+            match net_query_sql_with_status(client, base, auth_mut.clone(), "SELECT 1") {
+                Ok(_) => break,
+                Err(e) => {
+                    attempt += 1;
+                    if attempt >= 3 {
+                        return Err(anyhow::anyhow!(
+                            "authentication failed after 3 attempts: {e}"
+                        ));
+                    }
+                    println!("Authentication failed ({e}). Please re-enter password.");
+                    let p = rpassword::prompt_password("Password: ")?;
+                    auth_mut.basic_pass = Some(p);
+                }
+            }
+        }
+    }
+
+    let mut buffer = String::new();
     loop {
-        let prompt = "pieskieo(net)> ";
+        let prompt = if buffer.is_empty() {
+            "pieskieo(net)> "
+        } else {
+            "....> "
+        };
         let line = if let Some(ref mut editor) = rl {
             match editor.readline(prompt) {
                 Ok(l) => {
@@ -552,14 +593,26 @@ fn run_net_repl_with_prompt(
         if line.eq_ignore_ascii_case("quit") || line.eq_ignore_ascii_case("exit") {
             break;
         }
+        buffer.push_str(line);
+        buffer.push(' ');
+        let complete = line.trim_end().ends_with(';');
+        if !complete {
+            continue;
+        }
+        let stmt = buffer.trim();
+        if stmt.is_empty() {
+            buffer.clear();
+            continue;
+        }
         let start = Instant::now();
-        match net_query_sql(client, base, auth.clone(), line) {
+        match net_query_sql(client, base, auth.clone(), stmt) {
             Ok(out) => {
                 let elapsed = start.elapsed();
                 println!("{out}\n({:.2?})", elapsed);
             }
             Err(e) => eprintln!("error: {e}"),
         }
+        buffer.clear();
     }
     Ok(())
 }

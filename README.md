@@ -84,9 +84,9 @@ cargo run -p pieskieo-cli -- --connect pieskieo@localhost --port 8000 -W
 - Resharding (admin): `POST /v1/admin/reshard` with `{ "shards": N }` rebuilds shard set from WAL and atomically swaps the pool.
 
 ## CLI quickstart
-- Connect: `pieskieo connect alice@db.example.com --port 8443 -W`
+- Connect: `pieskieo connect -H db.example.com -p 8443 -U alice -W` (prompts password; retries on failure)
 - Server starter: `pieskieo connect --serve --data-dir ./data --listen 0.0.0.0:8000`
-- REPL commands: raw PQL; `\q` to quit; `\timing` to toggle timings.
+- REPL: raw PQL; multi-line supported (enter continues, semicolon sends). `quit` to exit.
 
 ## Config essentials (env)
 - `PIESKIEO_DATA` data dir (defaults: `/var/lib/pieskieo` on Linux/macOS, `%APPDATA%/Pieskieo` on Windows)

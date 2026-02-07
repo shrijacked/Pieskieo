@@ -34,8 +34,8 @@ use sqlparser::{dialect::GenericDialect, parser::Parser};
 use std::path::PathBuf;
 use tokio::{net::TcpListener, sync::RwLock};
 use tracing_appender::rolling;
-use tracing_subscriber::{EnvFilter, prelude::*};
 use tracing_subscriber::fmt::writer::MakeWriterExt;
+use tracing_subscriber::{prelude::*, EnvFilter};
 use uuid::Uuid;
 
 #[cfg(feature = "tls")]
