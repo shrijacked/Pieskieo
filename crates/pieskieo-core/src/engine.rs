@@ -114,25 +114,29 @@ impl PieskieoDb {
                         let ns = namespace.unwrap_or_else(Self::default_ns);
                         let col = collection.unwrap_or_else(Self::default_ns);
                         let v: Value = serde_json::from_slice(&payload)?;
-                        data.write()
+                        let mut guard = data.write();
+                        guard
                             .docs
-                            .entry(ns)
+                            .entry(ns.clone())
                             .or_default()
-                            .entry(col)
+                            .entry(col.clone())
                             .or_default()
-                            .insert(key, v);
+                            .insert(key, v.clone());
+                        Self::index_upsert_doc(&mut guard, ns, col, key, &v);
                     }
                     DataFamily::Row => {
                         let ns = namespace.unwrap_or_else(Self::default_ns);
                         let table = table.unwrap_or_else(Self::default_ns);
                         let v: Value = serde_json::from_slice(&payload)?;
-                        data.write()
+                        let mut guard = data.write();
+                        guard
                             .rows
-                            .entry(ns)
+                            .entry(ns.clone())
                             .or_default()
-                            .entry(table)
+                            .entry(table.clone())
                             .or_default()
-                            .insert(key, v);
+                            .insert(key, v.clone());
+                        Self::index_upsert_row(&mut guard, ns, table, key, &v);
                     }
                     DataFamily::Vec => match bincode::deserialize::<VecWalRecord>(&payload) {
                         Ok(rec) => {
@@ -173,18 +177,24 @@ impl PieskieoDb {
                     DataFamily::Doc => {
                         let ns = namespace.unwrap_or_else(Self::default_ns);
                         let col = collection.unwrap_or_else(Self::default_ns);
-                        if let Some(map) = data.write().docs.get_mut(&ns) {
+                        let mut guard = data.write();
+                        if let Some(map) = guard.docs.get_mut(&ns) {
                             if let Some(c) = map.get_mut(&col) {
-                                c.remove(&key);
+                                if let Some(old) = c.remove(&key) {
+                                    Self::index_remove_doc(&mut guard, ns, col, &key, &old);
+                                }
                             }
                         }
                     }
                     DataFamily::Row => {
                         let ns = namespace.unwrap_or_else(Self::default_ns);
                         let tbl = table.unwrap_or_else(Self::default_ns);
-                        if let Some(map) = data.write().rows.get_mut(&ns) {
+                        let mut guard = data.write();
+                        if let Some(map) = guard.rows.get_mut(&ns) {
                             if let Some(t) = map.get_mut(&tbl) {
-                                t.remove(&key);
+                                if let Some(old) = t.remove(&key) {
+                                    Self::index_remove_row(&mut guard, ns, tbl, &key, &old);
+                                }
                             }
                         }
                     }
@@ -470,8 +480,10 @@ impl PieskieoDb {
         limit: usize,
         offset: usize,
     ) -> Vec<(Uuid, Value)> {
-        self.filter_map(
-            &self.data.read().docs,
+        let guard = self.data.read();
+        self.filter_map_with_index(
+            &guard.docs,
+            &guard.doc_index,
             ns,
             collection,
             filter,
@@ -497,7 +509,16 @@ impl PieskieoDb {
         limit: usize,
         offset: usize,
     ) -> Vec<(Uuid, Value)> {
-        self.filter_map(&self.data.read().rows, ns, table, filter, limit, offset)
+        let guard = self.data.read();
+        self.filter_map_with_index(
+            &guard.rows,
+            &guard.row_index,
+            ns,
+            table,
+            filter,
+            limit,
+            offset,
+        )
     }
 
     pub fn put_vector(&self, id: Uuid, vector: Vec<f32>) -> Result<()> {
@@ -1037,6 +1058,58 @@ impl PieskieoDb {
                 }
             }
         }
+    }
+
+    /// Filter with optional equality index shortcut.
+    fn filter_map_with_index(
+        &self,
+        map: &HashMap<String, HashMap<String, BTreeMap<Uuid, Value>>>,
+        index: &HashMap<String, HashMap<String, HashMap<String, HashMap<String, Vec<Uuid>>>>>,
+        ns: Option<&str>,
+        coll: Option<&str>,
+        filter: &HashMap<String, Value>,
+        limit: usize,
+        offset: usize,
+    ) -> Vec<(Uuid, Value)> {
+        // attempt index if single namespace+collection specified and single equality filter
+        if let (Some(ns), Some(coll)) = (ns, coll) {
+            if filter.len() == 1 {
+                if let Some((fk, fv)) = filter.iter().next() {
+                    if let Some(key) = Self::index_key(fv) {
+                        if let Some(ns_map) = index.get(ns) {
+                            if let Some(col_map) = ns_map.get(coll) {
+                                if let Some(field_map) = col_map.get(fk) {
+                                    if let Some(ids) = field_map.get(&key) {
+                                        if let Some(inner) = map.get(ns).and_then(|m| m.get(coll)) {
+                                            let mut out = Vec::new();
+                                            let mut skipped = 0usize;
+                                            for id in ids {
+                                                if !self.owns(id) {
+                                                    continue;
+                                                }
+                                                if let Some(v) = inner.get(id) {
+                                                    if skipped < offset {
+                                                        skipped += 1;
+                                                        continue;
+                                                    }
+                                                    out.push((*id, v.clone()));
+                                                    if out.len() >= limit {
+                                                        return out;
+                                                    }
+                                                }
+                                            }
+                                            return out;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // fallback full scan
+        self.filter_map(map, ns, coll, filter, limit, offset)
     }
 
     fn index_key(v: &Value) -> Option<String> {

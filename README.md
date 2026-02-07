@@ -11,7 +11,7 @@ A Rust-first multimodal database engine combining document (Mongo-like), row (Po
 1. Rust toolchain installed.
 2. Linker: VS Build Tools (Desktop C++) **or** MinGW (set `PATH` to MinGW bin).
 3. Build: `cargo build --release`
-4. Run server:
+4. Run server (HTTP API):
 ```
 PIESKIEO_DATA=./data \
 PIESKIEO_LISTEN=0.0.0.0:8000 \
@@ -20,6 +20,9 @@ PIESKIEO_EF_SEARCH=50 \
 PIESKIEO_EF_CONSTRUCTION=200 \
 cargo run -p pieskieo-server --release
 ```
+5. CLI (embedded or server starter):
+   - Embedded shell: `cargo run -p pieskieo-cli -- --repl`
+   - Start server via CLI: `cargo run -p pieskieo-cli -- --serve --data-dir ./data --listen 0.0.0.0:8000`
 
 ## Key features
 - HNSW ANN with persistence (graph + revmap saved/reloaded).
@@ -28,6 +31,9 @@ cargo run -p pieskieo-server --release
 - Transparent sharding inside one process (hash on UUID); fan-out search merges top-k.
 - WAL + snapshot; vacuum to drop tombstones and truncate WAL.
 - Metrics endpoint (Prometheus text) including per-shard gauges.
+- Secondary equality indexes for docs/rows (string/number/bool) scoped per namespace+collection/table for faster filtered queries.
+- Namespaces + collections/tables, plus per-namespace vector indexes.
+- Python SDK (sync + async) with Pydantic models.
 
 ## HTTP API (JSON)
 - Health: `GET /healthz`

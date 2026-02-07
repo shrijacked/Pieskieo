@@ -31,11 +31,12 @@ rows_page_2 = c.query_rows({"item": "widget"}, limit=50, offset=50, namespace="t
 
 # Async client
 import asyncio
-from pieskieo import AsyncPieskieoClient
+from pieskieo import AsyncPieskieoClient, models
 
 async def main():
     async with AsyncPieskieoClient("http://localhost:8000") as ac:
-        vid = await ac.put_vector([0.1, 0.2, 0.3], namespace="team-a")
+        req = models.VectorInput(vector=[0.1,0.2,0.3], namespace="team-a")
+        vid = await ac.put_vector(req.vector, namespace=req.namespace)
         hits = await ac.search([0.1, 0.2, 0.3], k=3, namespace="team-a")
         print(hits)
 
