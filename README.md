@@ -76,6 +76,7 @@ cargo run -p pieskieo-cli -- --connect pieskieo@localhost --port 8000 -W
 - Lockout: 5 failed attempts within 15 minutes triggers a 5 minute lock (tunable via `PIESKIEO_AUTH_*` envs).
 - Basic auth for per-user, Bearer token via `PIESKIEO_TOKEN` for admin automation.
 - Enable TLS with `PIESKIEO_TLS_CERT` / `PIESKIEO_TLS_KEY` (PEM).
+- Per-IP rate limit middleware (default 300 requests / 60s); tune via `PIESKIEO_RATE_MAX` and `PIESKIEO_RATE_WINDOW_SECS`.
 
 ## CLI quickstart
 - Connect: `pieskieo connect alice@db.example.com --port 8443 -W`

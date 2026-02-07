@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -7,7 +7,7 @@ use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use axum::extract::DefaultBodyLimit;
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::Request,
     middleware::{self, Next},
     routing::{delete, get, post},
@@ -41,6 +41,7 @@ use {
 struct AppState {
     pool: Arc<DbPool>,
     auth: Arc<RwLock<AuthConfig>>,
+    limiter: Arc<RateLimiter>,
 }
 
 #[derive(Clone)]
@@ -52,6 +53,13 @@ struct AuthConfig {
     max_failures: u32,
     lockout: Duration,
     window: Duration,
+}
+
+#[derive(Clone)]
+struct RateLimiter {
+    window: Duration,
+    max: u32,
+    hits: Arc<Mutex<HashMap<IpAddr, (u32, Instant)>>>,
 }
 
 #[derive(Clone)]
@@ -307,6 +315,38 @@ impl AuthConfig {
     }
 }
 
+impl RateLimiter {
+    fn from_env() -> Self {
+        let max = std::env::var("PIESKIEO_RATE_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300);
+        let window = std::env::var("PIESKIEO_RATE_WINDOW_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(60));
+        Self {
+            window,
+            max,
+            hits: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn allow(&self, ip: IpAddr) -> bool {
+        let now = Instant::now();
+        let mut hits = self.hits.lock().unwrap();
+        let entry = hits.entry(ip).or_insert((0, now));
+        let (ref mut count, ref mut start) = *entry;
+        if now.duration_since(*start) > self.window {
+            *count = 0;
+            *start = now;
+        }
+        *count += 1;
+        *count <= self.max
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct UserDisk {
     user: String,
@@ -509,8 +549,13 @@ pub async fn serve() -> anyhow::Result<()> {
     let params = vector_params_from_env();
     let shards = params.shard_total.max(1);
     let pool = Arc::new(DbPool::new(&data_dir, params, shards)?);
+    let limiter = Arc::new(RateLimiter::from_env());
 
-    let state = AppState { pool, auth };
+    let state = AppState {
+        pool,
+        auth,
+        limiter,
+    };
 
     // background WAL flusher (group commit) for better latency.
     let flush_ms = std::env::var("PIESKIEO_WAL_FLUSH_MS")
@@ -598,6 +643,10 @@ pub async fn serve() -> anyhow::Result<()> {
         .route("/v1/auth/users", get(list_users))
         .route("/v1/auth/users", post(create_user))
         .layer(middleware::from_fn_with_state(
+            state.limiter.clone(),
+            rate_limit_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
             state.auth.clone(),
             auth_middleware,
         ))
@@ -639,7 +688,11 @@ pub async fn serve() -> anyhow::Result<()> {
 
     tracing::info!(%addr, "listening (plaintext)");
     let listener = TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -1282,7 +1335,7 @@ async fn metrics(
 
 async fn auth_middleware(
     State(auth): State<Arc<RwLock<AuthConfig>>>,
-    req: Request<Body>,
+    mut req: Request<Body>,
     next: Next,
 ) -> Result<axum::response::Response, ApiError> {
     let auth_guard = auth.read().await;
@@ -1309,15 +1362,15 @@ async fn auth_middleware(
                                 usr.user == u && AuthConfig::verify_password(&usr.password_hash, p)
                             }) {
                                 auth_guard.record_success(u);
+                                req.extensions_mut().insert(user.role);
                                 if authorize(user.role, req.uri().path(), req.method().as_str()) {
-                                    let mut req = req;
-                                    req.extensions_mut().insert(user.role);
                                     return Ok(next.run(req).await);
                                 } else {
                                     return Err(ApiError::Forbidden);
                                 }
                             } else {
                                 auth_guard.record_failure(u);
+                                tracing::warn!(user = %u, "auth failure");
                             }
                         }
                     }
@@ -1326,6 +1379,18 @@ async fn auth_middleware(
         }
     }
     Err(ApiError::Unauthorized)
+}
+
+async fn rate_limit_middleware(
+    State(limiter): State<Arc<RateLimiter>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    req: Request<Body>,
+    next: Next,
+) -> Result<axum::response::Response, ApiError> {
+    if limiter.allow(addr.ip()) {
+        return Ok(next.run(req).await);
+    }
+    Err(ApiError::TooMany)
 }
 
 fn authorize(role: Role, path: &str, method: &str) -> bool {
@@ -1402,6 +1467,7 @@ enum ApiError {
     Conflict(String),
     Unauthorized,
     Forbidden,
+    TooMany,
     Internal(anyhow::Error),
 }
 
@@ -1429,6 +1495,7 @@ impl axum::response::IntoResponse for ApiError {
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
             ApiError::Unauthorized => StatusCode::UNAUTHORIZED.into_response(),
             ApiError::Forbidden => StatusCode::FORBIDDEN.into_response(),
+            ApiError::TooMany => StatusCode::TOO_MANY_REQUESTS.into_response(),
             ApiError::Internal(err) => {
                 tracing::error!("api_error" = %err);
                 StatusCode::INTERNAL_SERVER_ERROR.into_response()
