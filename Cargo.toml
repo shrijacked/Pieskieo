@@ -2,6 +2,7 @@
 members = [
     "crates/pieskieo-core",
     "crates/pieskieo-server",
+    "crates/pieskieo-cli",
 ]
 resolver = "2"
 
