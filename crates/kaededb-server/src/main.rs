@@ -7,6 +7,7 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
+use futures::future::join_all;
 use kaededb_core::{KaedeDb, KaedeDbError, VectorParams as KaedeDbVectorParams};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -510,11 +511,18 @@ async fn search_vector(
     }
 
     // For now metric selection is per-query; in future persist per-index config.
+    let futures = state
+        .pool
+        .each()
+        .map(|shard| {
+            let q = input.query.clone();
+            let filter = input.filter_meta.clone();
+            tokio::task::spawn_blocking(move || shard.search_vector_metric(&q, k, metric, filter))
+        })
+        .collect::<Vec<_>>();
     let mut all_hits = Vec::new();
-    for shard in state.pool.each() {
-        if let Ok(mut h) =
-            shard.search_vector_metric(&input.query, k, metric, input.filter_meta.clone())
-        {
+    for res in join_all(futures).await {
+        if let Ok(Ok(mut h)) = res {
             all_hits.append(&mut h);
         }
     }
@@ -644,8 +652,8 @@ async fn metrics(
     State(state): State<AppState>,
 ) -> Result<impl axum::response::IntoResponse, ApiError> {
     let m = state.pool.aggregate_metrics();
-    let body = format!(
-        "kaededb_docs {}\nkaededb_rows {}\nkaededb_vectors {}\nkaededb_vector_tombstones {}\nkaededb_hnsw_ready {}\nkaededb_ef_search {}\nkaededb_ef_construction {}\nkaededb_link_top_k {}\nkaededb_shard_id {}\nkaededb_shard_total {}\n",
+    let mut body = format!(
+        "kaededb_docs {}\nkaededb_rows {}\nkaededb_vectors {}\nkaededb_vector_tombstones {}\nkaededb_hnsw_ready {}\nkaededb_ef_search {}\nkaededb_ef_construction {}\nkaededb_link_top_k {}\nkaededb_shard_total {}\n",
         m.docs,
         m.rows,
         m.vectors,
@@ -654,9 +662,15 @@ async fn metrics(
         m.ef_search,
         m.ef_construction,
         m.link_top_k,
-        m.shard_id,
         m.shard_total,
     );
+    for (idx, shard) in state.pool.shards.iter().enumerate() {
+        let s = shard.metrics();
+        body.push_str(&format!(
+            "kaededb_shard_vectors{{shard=\"{}\"}} {}\nkaededb_shard_docs{{shard=\"{}\"}} {}\nkaededb_shard_rows{{shard=\"{}\"}} {}\n",
+            idx, s.vectors, idx, s.docs, idx, s.rows
+        ));
+    }
     let resp = (
         [(
             axum::http::header::CONTENT_TYPE,
