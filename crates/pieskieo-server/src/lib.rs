@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -47,6 +48,8 @@ struct AppState {
     limiter: Arc<RateLimiter>,
     audit: Arc<AuditLog>,
     data_dir: String,
+    pause_writes: Arc<AtomicBool>,
+    reshard_status: Arc<RwLock<Option<String>>>,
 }
 
 #[derive(Clone)]
@@ -543,6 +546,11 @@ struct ReshardRequest {
     shards: usize,
 }
 
+#[derive(Serialize)]
+struct ReshardStatus {
+    status: Option<String>,
+    paused: bool,
+}
 #[derive(Deserialize)]
 struct WalQuery {
     since: Option<u64>,
@@ -700,6 +708,8 @@ pub async fn serve() -> anyhow::Result<()> {
         limiter,
         audit,
         data_dir,
+        pause_writes: Arc::new(AtomicBool::new(false)),
+        reshard_status: Arc::new(RwLock::new(None)),
     };
 
     // background WAL flusher (group commit) for better latency.
@@ -788,6 +798,7 @@ pub async fn serve() -> anyhow::Result<()> {
         .route("/v1/replica/apply", post(replica_apply))
         .route("/metrics", get(metrics))
         .route("/v1/admin/reshard", post(reshard))
+        .route("/v1/admin/reshard/status", get(reshard_status))
         .route("/v1/graph/edge", post(add_edge))
         .route("/v1/graph/:id", get(list_neighbors))
         .route("/v1/graph/:id/bfs", get(list_bfs))
@@ -905,6 +916,9 @@ async fn put_doc(
     State(state): State<AppState>,
     Json(input): Json<DocInput>,
 ) -> Result<Json<ApiResponse<Uuid>>, ApiError> {
+    if state.pause_writes.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(ApiError::Conflict("resharding in progress".into()));
+    }
     let id = input.id.unwrap_or_else(Uuid::new_v4);
     state
         .pool
@@ -961,6 +975,9 @@ async fn put_row(
     State(state): State<AppState>,
     Json(input): Json<RowInput>,
 ) -> Result<Json<ApiResponse<Uuid>>, ApiError> {
+    if state.pause_writes.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(ApiError::Conflict("resharding in progress".into()));
+    }
     let id = input.id.unwrap_or_else(Uuid::new_v4);
     state
         .pool
@@ -1189,6 +1206,9 @@ async fn put_vector(
     State(state): State<AppState>,
     Json(input): Json<VectorInput>,
 ) -> Result<Json<ApiResponse<&'static str>>, ApiError> {
+    if state.pause_writes.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(ApiError::Conflict("resharding in progress".into()));
+    }
     state
         .pool
         .read()
@@ -1211,6 +1231,9 @@ async fn put_vector_bulk(
     State(state): State<AppState>,
     Json(input): Json<VectorBulk>,
 ) -> Result<Json<ApiResponse<usize>>, ApiError> {
+    if state.pause_writes.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(ApiError::Conflict("resharding in progress".into()));
+    }
     let mut stored = 0usize;
     let pool = state.pool.read().await;
     for item in input.items {
@@ -1640,6 +1663,13 @@ async fn reshard(
     if !matches!(role, Role::Admin) {
         return Err(ApiError::Forbidden);
     }
+    state
+        .pause_writes
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    {
+        let mut s = state.reshard_status.write().await;
+        *s = Some(format!("reshard starting to {} shards", input.shards));
+    }
     let new_shards = input.shards.max(1);
     let (wal, template) = {
         let guard = state.pool.read().await;
@@ -1659,9 +1689,27 @@ async fn reshard(
         let mut guard = state.pool.write().await;
         *guard = new_pool;
     }
+    state
+        .pause_writes
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    {
+        let mut s = state.reshard_status.write().await;
+        *s = Some(format!("reshard complete to {} shards", new_shards));
+    }
     Ok(Json(ApiResponse {
         ok: true,
         data: "resharded",
+    }))
+}
+
+async fn reshard_status(
+    State(state): State<AppState>,
+) -> Result<Json<ApiResponse<ReshardStatus>>, ApiError> {
+    let paused = state.pause_writes.load(std::sync::atomic::Ordering::SeqCst);
+    let status = state.reshard_status.read().await.clone();
+    Ok(Json(ApiResponse {
+        ok: true,
+        data: ReshardStatus { status, paused },
     }))
 }
 
