@@ -5,6 +5,10 @@ use crate::{error::PieskieoError, graph::GraphStore};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sqlparser::ast::{BinaryOperator, Expr, SelectItem, SetExpr, Statement, TableFactor};
+use sqlparser::dialect::GenericDialect;
+use sqlparser::parser::Parser;
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -521,6 +525,37 @@ impl PieskieoDb {
         )
     }
 
+    /// SQL-ish query over docs or rows. Supported:
+    /// SELECT * FROM namespace.collection WHERE a = 1 AND b > 2 LIMIT 100 OFFSET 10;
+    /// namespace or collection may be omitted (defaults to "default").
+    pub fn query_sql(&self, sql: &str) -> Result<Vec<(Uuid, Value)>> {
+        let dialect = GenericDialect {};
+        let ast = Parser::parse_sql(&dialect, sql)
+            .map_err(|e| PieskieoError::Internal(format!("sql parse error: {e}").into()))?;
+        if ast.len() != 1 {
+            return Err(PieskieoError::Internal("one statement expected".into()));
+        }
+        let stmt = &ast[0];
+        let (ns, coll, conds, limit, offset, target_rows) = self.parse_select(stmt)?;
+        if target_rows {
+            let guard = self.data.read();
+            if let Some(ns_map) = guard.rows.get(&ns) {
+                if let Some(map) = ns_map.get(&coll) {
+                    return Ok(self.filter_conditions(map, &conds, limit, offset));
+                }
+            }
+            Ok(Vec::new())
+        } else {
+            let guard = self.data.read();
+            if let Some(ns_map) = guard.docs.get(&ns) {
+                if let Some(map) = ns_map.get(&coll) {
+                    return Ok(self.filter_conditions(map, &conds, limit, offset));
+                }
+            }
+            Ok(Vec::new())
+        }
+    }
+
     pub fn put_vector(&self, id: Uuid, vector: Vec<f32>) -> Result<()> {
         self.put_vector_with_meta_ns(None, id, vector, None)
     }
@@ -936,7 +971,7 @@ impl PieskieoDb {
 fn value_matches(doc: &Value, filter: &HashMap<String, Value>) -> bool {
     for (k, v) in filter {
         if let Some(field) = doc.get(k) {
-            if field != v {
+            if !value_compare(field, v) {
                 return false;
             }
         } else {
@@ -944,6 +979,299 @@ fn value_matches(doc: &Value, filter: &HashMap<String, Value>) -> bool {
         }
     }
     true
+}
+
+fn value_compare(field: &Value, cond: &Value) -> bool {
+    if !cond.is_object() {
+        return field == cond;
+    }
+    let obj = cond.as_object().unwrap();
+    for (op, val) in obj {
+        match op.as_str() {
+            "$gt" => {
+                if !cmp_values(field, val).map(|o| o.is_gt()).unwrap_or(false) {
+                    return false;
+                }
+            }
+            "$gte" => {
+                if !cmp_values(field, val).map(|o| o.is_ge()).unwrap_or(false) {
+                    return false;
+                }
+            }
+            "$lt" => {
+                if !cmp_values(field, val).map(|o| o.is_lt()).unwrap_or(false) {
+                    return false;
+                }
+            }
+            "$lte" => {
+                if !cmp_values(field, val).map(|o| o.is_le()).unwrap_or(false) {
+                    return false;
+                }
+            }
+            "$ne" => {
+                if field == val {
+                    return false;
+                }
+            }
+            "$in" => {
+                if let Some(arr) = val.as_array() {
+                    if !arr.iter().any(|x| x == field) {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
+            }
+            "$nin" => {
+                if let Some(arr) = val.as_array() {
+                    if arr.iter().any(|x| x == field) {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn cmp_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => {
+            let xf = x.as_f64()?;
+            let yf = y.as_f64()?;
+            xf.partial_cmp(&yf)
+        }
+        (Value::String(x), Value::String(y)) => Some(x.cmp(y)),
+        (Value::Bool(x), Value::Bool(y)) => Some(x.cmp(y)),
+        _ => None,
+    }
+}
+
+#[derive(Clone)]
+struct Condition {
+    field: String,
+    op: Op,
+    value: Value,
+}
+
+#[derive(Clone)]
+enum Op {
+    Eq,
+    Ne,
+    Gt,
+    Gte,
+    Lt,
+    Lte,
+    In,
+    Nin,
+}
+
+impl PieskieoDb {
+    fn filter_conditions(
+        &self,
+        inner: &BTreeMap<Uuid, Value>,
+        conds: &[Condition],
+        limit: usize,
+        offset: usize,
+    ) -> Vec<(Uuid, Value)> {
+        let mut out = Vec::new();
+        let mut skipped = 0usize;
+        'outer: for (id, v) in inner.iter() {
+            if !self.owns(id) {
+                continue;
+            }
+            for c in conds {
+                let Some(field_val) = v.get(&c.field) else {
+                    continue 'outer;
+                };
+                let pass = match c.op {
+                    Op::Eq => field_val == &c.value,
+                    Op::Ne => field_val != &c.value,
+                    Op::Gt => cmp_values(field_val, &c.value)
+                        .map(|o| o.is_gt())
+                        .unwrap_or(false),
+                    Op::Gte => cmp_values(field_val, &c.value)
+                        .map(|o| o.is_ge())
+                        .unwrap_or(false),
+                    Op::Lt => cmp_values(field_val, &c.value)
+                        .map(|o| o.is_lt())
+                        .unwrap_or(false),
+                    Op::Lte => cmp_values(field_val, &c.value)
+                        .map(|o| o.is_le())
+                        .unwrap_or(false),
+                    Op::In => c
+                        .value
+                        .as_array()
+                        .map(|arr| arr.iter().any(|x| x == field_val))
+                        .unwrap_or(false),
+                    Op::Nin => c
+                        .value
+                        .as_array()
+                        .map(|arr| arr.iter().all(|x| x != field_val))
+                        .unwrap_or(false),
+                };
+                if !pass {
+                    continue 'outer;
+                }
+            }
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            out.push((*id, v.clone()));
+            if out.len() >= limit {
+                break;
+            }
+        }
+        out
+    }
+
+    fn parse_select(
+        &self,
+        stmt: &Statement,
+    ) -> Result<(String, String, Vec<Condition>, usize, usize, bool)> {
+        let (select, query) = match stmt {
+            Statement::Query(q) => match &*q.body {
+                SetExpr::Select(s) => (s.as_ref(), q),
+                _ => return Err(PieskieoError::Internal("only SELECT supported".into())),
+            },
+            _ => return Err(PieskieoError::Internal("only SELECT supported".into())),
+        };
+        if !select
+            .projection
+            .iter()
+            .all(|p| matches!(p, SelectItem::Wildcard(_)))
+        {
+            return Err(PieskieoError::Internal("only SELECT * supported".into()));
+        }
+        let tbl = select
+            .from
+            .get(0)
+            .and_then(|t| match &t.relation {
+                TableFactor::Table { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| PieskieoError::Internal("FROM required".into()))?;
+        let (ns, coll) = if tbl.0.len() == 2 {
+            (tbl.0[0].value.clone(), tbl.0[1].value.clone())
+        } else {
+            ("default".into(), tbl.0[0].value.clone())
+        };
+        let mut conds = Vec::new();
+        if let Some(selection) = &select.selection {
+            self.walk_expr(selection, &mut conds)?;
+        }
+        let limit = query
+            .limit
+            .as_ref()
+            .and_then(|l| match l {
+                Expr::Value(sqlparser::ast::Value::Number(n, _)) => n.parse().ok(),
+                _ => None,
+            })
+            .unwrap_or(100);
+        let offset = query
+            .offset
+            .as_ref()
+            .and_then(|o| match &o.value {
+                Expr::Value(sqlparser::ast::Value::Number(n, _)) => n.parse().ok(),
+                _ => None,
+            })
+            .unwrap_or(0);
+        // heuristic: collections treated as docs, tables (explicit keyword) treated as rows
+        let target_rows = select
+            .from
+            .get(0)
+            .map(|_| {
+                tbl.0
+                    .last()
+                    .map(|s| s.value.contains("table"))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        Ok((ns, coll, conds, limit, offset, target_rows))
+    }
+
+    fn walk_expr(&self, expr: &Expr, out: &mut Vec<Condition>) -> Result<()> {
+        match expr {
+            Expr::BinaryOp { left, op, right } => match op {
+                BinaryOperator::And => {
+                    self.walk_expr(left, out)?;
+                    self.walk_expr(right, out)?;
+                    Ok(())
+                }
+                BinaryOperator::Eq
+                | BinaryOperator::NotEq
+                | BinaryOperator::Gt
+                | BinaryOperator::GtEq
+                | BinaryOperator::Lt
+                | BinaryOperator::LtEq => {
+                    let (field, value) = self.extract_field_value(left, right)?;
+                    let op = match op {
+                        BinaryOperator::Eq => Op::Eq,
+                        BinaryOperator::NotEq => Op::Ne,
+                        BinaryOperator::Gt => Op::Gt,
+                        BinaryOperator::GtEq => Op::Gte,
+                        BinaryOperator::Lt => Op::Lt,
+                        BinaryOperator::LtEq => Op::Lte,
+                        _ => unreachable!(),
+                    };
+                    out.push(Condition { field, op, value });
+                    Ok(())
+                }
+                _ => Err(PieskieoError::Internal("operator not supported".into())),
+            },
+            Expr::InList {
+                expr,
+                list,
+                negated,
+                ..
+            } => {
+                let field = Self::ident_name(expr)?;
+                let values: Vec<Value> = list.iter().filter_map(Self::literal_to_value).collect();
+                let op = if *negated { Op::Nin } else { Op::In };
+                out.push(Condition {
+                    field,
+                    op,
+                    value: Value::Array(values),
+                });
+                Ok(())
+            }
+            _ => Err(PieskieoError::Internal("expression not supported".into())),
+        }
+    }
+
+    fn ident_name(expr: &Expr) -> Result<String> {
+        if let Expr::Identifier(id) = expr {
+            Ok(id.value.clone())
+        } else {
+            Err(PieskieoError::Internal("field must be identifier".into()))
+        }
+    }
+
+    fn literal_to_value(expr: &Expr) -> Option<Value> {
+        match expr {
+            Expr::Value(sqlparser::ast::Value::Number(n, _)) => n
+                .parse::<f64>()
+                .ok()
+                .and_then(|f| serde_json::Number::from_f64(f))
+                .map(Value::Number),
+            Expr::Value(sqlparser::ast::Value::SingleQuotedString(s)) => {
+                Some(Value::String(s.clone()))
+            }
+            Expr::Value(sqlparser::ast::Value::Boolean(b)) => Some(Value::Bool(*b)),
+            _ => None,
+        }
+    }
+
+    fn extract_field_value(&self, left: &Expr, right: &Expr) -> Result<(String, Value)> {
+        let field = Self::ident_name(left)?;
+        let value = Self::literal_to_value(right)
+            .ok_or_else(|| PieskieoError::Internal("unsupported literal".into()))?;
+        Ok((field, value))
+    }
 }
 
 impl PieskieoDb {

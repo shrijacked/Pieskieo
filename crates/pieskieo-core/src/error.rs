@@ -12,6 +12,8 @@ pub enum PieskieoError {
     NotFound,
     #[error("wrong shard")]
     WrongShard,
+    #[error("internal error: {0}")]
+    Internal(String),
 }
 
 pub type Result<T> = std::result::Result<T, PieskieoError>;
