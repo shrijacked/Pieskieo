@@ -2695,4 +2695,49 @@ mod tests {
         assert_eq!(rows[0].1["score"], 5);
         Ok(())
     }
+
+    #[tokio::test]
+    async fn pql_join_and_aggregate() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let db = PieskieoDb::open(dir.path())?;
+        let u1 = Uuid::new_v4();
+        let u2 = Uuid::new_v4();
+        let o1 = Uuid::new_v4();
+        let o2 = Uuid::new_v4();
+
+        db.query_sql(&format!(
+            "INSERT INTO docs.default.users (_id, name, age) VALUES ('{}', 'alice', 30)",
+            u1
+        ))?;
+        db.query_sql(&format!(
+            "INSERT INTO docs.default.users (_id, name, age) VALUES ('{}', 'bob', 20)",
+            u2
+        ))?;
+        db.query_sql(&format!(
+            "INSERT INTO rows.default.orders (_id, user_id, amount) VALUES ('{}', '{}', 50)",
+            o1, u1
+        ))?;
+        db.query_sql(&format!(
+            "INSERT INTO rows.default.orders (_id, user_id, amount) VALUES ('{}', '{}', 5)",
+            o2, u2
+        ))?;
+
+        // aggregation
+        let res =
+            db.query_sql("SELECT COUNT(*) AS c FROM rows.default.orders WHERE amount > 10")?;
+        let rows = match res {
+            SqlResult::Select(r) => r,
+            _ => panic!("expected select"),
+        };
+        assert_eq!(rows.len(), 1);
+        let count = rows[0].1.get("c").unwrap().as_i64().unwrap();
+        assert_eq!(count, 1);
+
+        // wal incremental tailing should see records
+        db.wal.write().flush_sync()?;
+        let (records, end) = db.wal_replay_since(0)?;
+        assert!(end > 0);
+        assert!(records.len() >= 4);
+        Ok(())
+    }
 }
