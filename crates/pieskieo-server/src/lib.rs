@@ -101,16 +101,49 @@ impl AuditLog {
             "{ts},{ip},{method},{path},{status},{role},{:.3}\n",
             dur.as_secs_f64() * 1000.0
         );
-        let target = self.path.clone();
+        let target = self.rotate_target();
         tokio::task::spawn_blocking(move || {
-            if let Some(parent) = target.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
+            let _ = ensure_parent(&target);
             if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&target) {
                 let _ = f.write_all(line.as_bytes());
             }
         });
     }
+
+    fn rotate_target(&self) -> PathBuf {
+        // daily files and size-based rollover
+        let max_mb = std::env::var("PIESKIEO_AUDIT_MAX_MB")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(10);
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let base = self
+            .path
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_else(|| "audit.log".into());
+        let dir = self
+            .path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let candidate = dir.join(format!("{today}-{base}"));
+        let limit = max_mb * 1024 * 1024;
+        if let Ok(meta) = std::fs::metadata(&candidate) {
+            if meta.len() >= limit {
+                let ts = chrono::Utc::now().format("%H%M%S").to_string();
+                return dir.join(format!("{today}-{ts}-{base}"));
+            }
+        }
+        candidate
+    }
+}
+
+fn ensure_parent(path: &PathBuf) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(())
 }
 #[derive(Clone)]
 struct UserRec {

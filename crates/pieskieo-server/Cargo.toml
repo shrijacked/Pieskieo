@@ -30,6 +30,7 @@ rustls-pemfile = { version = "1", optional = true }
 tower = { workspace = true }
 hyper = { version = "1", optional = true, features = ["server", "http1", "http2"] }
 axum-server = { version = "0.6", optional = true, features = ["rustls"] }
+chrono = "0.4"
 
 [features]
 default = []
