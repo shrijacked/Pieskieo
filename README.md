@@ -41,14 +41,12 @@ cargo run -p pieskieo-cli -- --connect pieskieo@localhost --port 8000 -W
 ```
 `-W` prompts for password; use bearer with `-t <token>`. The REPL accepts raw PQL.
 
-## Installers
-- Windows (PowerShell):  
-  `iwr https://raw.githubusercontent.com/DarsheeeGamer/Pieskieo/main/install/get-pieskieo.ps1 -UseBasicParsing | iex`  
-  Installs prebuilt binaries into `%ProgramData%\Pieskieo\bin` (or override with `PIESKIEO_PREFIX`).
-
-- Linux/macOS (service by default on Linux):  
-  `curl -fsSL https://raw.githubusercontent.com/DarsheeeGamer/Pieskieo/main/install/get-pieskieo.sh | sudo bash`  
-  Installs prebuilt binaries into `/usr/local/bin` and, on Linux, sets up and starts a `pieskieo` systemd service (data dir `/var/lib/pieskieo`, listen `0.0.0.0:8000`). Use `PIESKIEO_VERSION` to pin a tag, `PIESKIEO_PREFIX` to change install prefix.
+## Install
+Installers are temporarily removed; build from source:
+```
+cargo build --release
+```
+Binaries: `target/release/pieskieo-server`, `pieskieo`, `load`, `bench`.
 
 ## Key features
 - HNSW ANN with persistence (graph + revmap saved/reloaded).
@@ -92,10 +90,9 @@ cargo run -p pieskieo-cli -- --connect pieskieo@localhost --port 8000 -W
 - Incremental replication: `/v1/replica/wal?since=<offset>` returns per-shard slices and `end_offset`; pull/apply in a loop to stay in sync.
 - Resharding (admin): `POST /v1/admin/reshard` with `{ "shards": N }` rebuilds shard set from WAL and atomically swaps the pool.
 
-## CLI quickstart
-- Connect: `pieskieo connect -H db.example.com -p 8443 -U alice -W` (prompts password; retries on failure)
-- Server starter: `pieskieo connect --serve --data-dir ./data --listen 0.0.0.0:8000`
-- REPL: raw PQL; multi-line supported (enter continues, semicolon sends). `quit` to exit.
+## CLI quickstart (network-only)
+  - Connect: `pieskieo connect -H db.example.com -p 8443 -U alice -W` (prompts password; retries on failure)
+  - REPL: `pieskieo --repl` (defaults http://127.0.0.1:8000; use `--server-url` to override). Multi-line supported; `quit` to exit.
 
 ## Config essentials (env)
 - `PIESKIEO_DATA` data dir (defaults: `$XDG_DATA_HOME/pieskieo` or `~/.local/share/pieskieo` on Linux/macOS, `%APPDATA%/Pieskieo` on Windows)
