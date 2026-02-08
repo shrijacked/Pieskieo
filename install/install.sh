@@ -6,7 +6,7 @@ set -euo pipefail
 # Usage: curl -fsSL https://raw.githubusercontent.com/DarsheeeGamer/Pieskieo/main/install/install.sh | bash
 
 PREFIX=${PIESKIEO_PREFIX:-/usr/local}
-SERVICE=${PIESKIEO_SERVICE:-0}
+SERVICE=${PIESKIEO_SERVICE:-1}
 VERSION=${PIESKIEO_VERSION:-}
 
 log(){ printf '%s\n' "$*" >&2; }
